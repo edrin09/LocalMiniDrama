@@ -1,0 +1,139 @@
+// LocalMiniDrama - LocalMiniDrama AI漫剧生成系统数据模型（与老系统兼容）
+// 文档见 重构开发文档-v2.md §3.1
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Drama {
+  id          Int         @id @default(autoincrement())
+  title       String
+  description String?
+  dialect     String?                  // 剧集级方言（级联第三级）
+  coverStyle  String?                  // 封面风格
+  seed        Int?                     // 本剧固定随机种子
+  characters  Character[]
+  episodes    Episode[]
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  deletedAt   DateTime?
+
+  @@index([deletedAt])
+}
+
+model Character {
+  id          Int       @id @default(autoincrement())
+  dramaId     Int
+  name        String
+  dialect     String?   // 角色级方言（级联第二级）
+  role        String?   // main/supporting/minor
+  roleLabel   String?
+  appearance  String?   // 外貌描述
+  anchors     String?   // 6层视觉锚点 JSON
+  imageUrl    String?   // 本地 /uploads/... 路径
+  sourceUrl   String?   // 远端原始图 URL（可被视频接口公开访问）
+  intro       String?   // 角色简介
+  referenceImageUrl String? // 用户上传的参考图（区别于 AI 生成 imageUrl）
+  storyboards Storyboard[]
+  drama       Drama     @relation(fields: [dramaId], references: [id])
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+}
+
+model Scene {
+  id          Int        @id @default(autoincrement())
+  episodeId   Int
+  location    String
+  time        String?
+  description String?
+  prompt      String?    // 单图提示词
+  quadPrompt  String?    // 四视图提示词
+  imageUrl    String?
+  referenceImageUrl String? // 用户上传参考图
+  sourceUrl   String?    // 远端原始图 URL
+  useQuadGrid Boolean    @default(false)
+  episode     Episode    @relation(fields: [episodeId], references: [id])
+  storyboards Storyboard[]
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  deletedAt   DateTime?
+}
+
+model Prop {
+  id          Int       @id @default(autoincrement())
+  episodeId   Int
+  name        String
+  type        String?
+  description String?
+  prompt      String?
+  imageUrl    String?
+  referenceImageUrl String? // 用户上传参考图
+  sourceUrl   String?  // 远端原始图 URL
+  useQuadGrid Boolean   @default(false)
+  episode     Episode   @relation(fields: [episodeId], references: [id])
+  storyboards Storyboard[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+}
+
+model Episode {
+  id           Int         @id @default(autoincrement())
+  dramaId      Int
+  title        String
+  episodeNumber Int?       // 集编号
+  description  String?
+  duration     Float?
+  status       String?     // draft/editing/completed
+  merged       Boolean     @default(false)   // ⑤ 是否已合成
+  mergedUrl    String?     // 成片地址（/uploads/...）
+  mergeCfg     String?     // JSON：burn_dialogue_audio / burn_narration_subtitles / aspect_ratio / frame_rate / resolution
+  genCfg       String?     // JSON：生成一致性配置 { language, allowSinging }
+  scriptText   String?     // 剧本原文：AI 拆解（角色/场景/道具/分镜）的输入源
+  drama        Drama       @relation(fields: [dramaId], references: [id])
+  storyboards  Storyboard[]
+  scenes       Scene[]
+  props        Prop[]
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  deletedAt    DateTime?
+}
+
+model Storyboard {
+  id           Int       @id @default(autoincrement())
+  episodeId    Int
+  number       Int
+  characterId  Int?
+  sceneId      Int?
+  propId       Int?
+  dialogue     String?
+  narration    String?
+  sceneDescription String? // 分镜画面描述：本镜画面内容/机位/构图（注入生图提示词）
+  motionDescription String? // 分镜动作描述：角色动作与镜头运动（注入生图/生视频提示词）
+  emotion      String?
+  duration     Float?
+  dialect      String?   // 分镜级方言（级联第一级）
+  imageUrl     String?   // 分镜参考图（首帧，本地路径）
+  referenceImageUrl String? // 用户上传的参考图（区别于 AI 生成首帧）
+  sourceUrl    String?   // 首帧远端原始 URL（供视频 keyframe 公开访问）
+  lastFrameUrl String?   // 尾帧（供下一分镜衔接，本地路径）
+  lastFrameSourceUrl String? // 尾帧远端原始 URL
+  imagePrompt  String?   // 生图提示词
+  videoPrompt  String?   // 生视频提示词
+  audioUrl     String?   // TTS 对白音轨（合成时混入，未配音则保留 AI 原声）
+  videoUrl     String?
+  status       String?   // pending/generating/finished/cancelled
+  episode      Episode   @relation(fields: [episodeId], references: [id])
+  character    Character? @relation(fields: [characterId], references: [id])
+  scene        Scene?    @relation(fields: [sceneId], references: [id])
+  prop         Prop?     @relation(fields: [propId], references: [id])
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+}

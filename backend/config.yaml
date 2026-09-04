@@ -1,0 +1,25 @@
+# LocalMiniDrama 后端配置（老系统 config.yaml 兼容）
+database:
+  dialect: sqlite
+  url: "${DATABASE_URL}"
+
+storage:
+  root: "${UPLOAD_DIR}"
+
+api_scheduler:
+  max_image_concurrency: 3
+  max_video_concurrency: 2
+  max_retries: 5
+  retry_initial_delay_ms: 1000
+  retry_max_delay_ms: 30000
+
+ai_services:
+  default_provider: agnes
+  providers:
+    agnes:
+      type: aggregate
+      base_url: "${AGNES_BASE_URL}"
+      models:
+        text: "agnes-2.5-flash"
+        image: "agnes-image-2.1-flash"
+        video: "agnes-video-2.5-flash"
