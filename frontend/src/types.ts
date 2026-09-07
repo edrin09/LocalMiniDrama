@@ -40,6 +40,8 @@ export interface GenConfig {
   language: string;
   /** 是否允许唱词（默认 false = 禁止唱歌，保证全剧一致） */
   allowSinging: boolean;
+  /** 画面风格：cartoon（默认）| anime2d | anime3d | realistic | watercolor */
+  artStyle: string;
 }
 
 export interface SchedulerConfig {
@@ -120,8 +122,10 @@ export interface Storyboard {
   episodeId: number;
   number: number;
   characterId?: number | null;
+  characterIds?: number[];
   sceneId?: number | null;
   propId?: number | null;
+  propIds?: number[];
   dialogue?: string | null;
   narration?: string | null;
   sceneDescription?: string | null;

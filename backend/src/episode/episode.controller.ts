@@ -31,6 +31,17 @@ export class EpisodeController {
     return this.episodeService.create(dto);
   }
 
+  // 一键导入整本剧本：按「第N集」拆分批量建分集 + 填剧本
+  @Post('import-script')
+  importScript(
+    @Body() body: { dramaId: number; text?: string; mode?: 'append' | 'replace' },
+  ) {
+    return this.episodeService.importScript(body?.dramaId, {
+      text: body?.text,
+      mode: body?.mode,
+    });
+  }
+
   @Put(':id')
   update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpdateEpisodeDto) {
     return this.episodeService.update(id, dto);

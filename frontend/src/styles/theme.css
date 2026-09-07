@@ -1,7 +1,5 @@
-/* Tailwind utilities（flex / grid / gap / padding / margin 等原子类依赖它）。
-   必须放在本文件最前，保证后文的 .lmd-* 类与组件 scoped 样式可覆盖同名规则。
-   注意：tailwind.config.js 已关闭 preflight，不会破坏 Element Plus 基础样式。 */
-@tailwind utilities;
+/* 布局工具类已从 Tailwind 迁移到独立的 utilities.css（替代弃用的 @tailwind utilities），
+   在 main.ts 中先于本文件引入，保证 .lmd-* 类与组件 scoped 样式可覆盖同名规则。 */
 
 /* ===== LocalMiniDrama 浅色主题 token（对照 重构开发文档-v2.md §2.1） ===== */
 :root {
@@ -15,6 +13,9 @@
   --purple: #8b5cf6;
   --emerald: #10b981;
   --rose: #f43f5e;
+  --orange: #f97316;
+  --amber: #f59e0b;
+  --orange-soft: rgba(249, 115, 22, 0.12);
   --indigo-soft: rgba(99, 102, 241, 0.12);
   --purple-soft: rgba(139, 92, 246, 0.14);
   --emerald-soft: rgba(16, 185, 129, 0.14);

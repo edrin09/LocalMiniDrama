@@ -10,11 +10,11 @@ import {
   Edit,
   Setting,
   VideoCamera,
+  VideoPlay,
   Picture,
   RefreshRight,
   Refresh,
   Upload,
-  Microphone,
 } from '@element-plus/icons-vue';
 import {
   episodeApi,
@@ -71,15 +71,33 @@ const generating = ref(false);
 const mergeRunning = ref(false);
 const mergeProgress = ref(0);
 
+/** 流水线进度（供「成片进度流程图」实时定位当前步骤） */
+const PIPELINE_STEPS = [
+  { key: 'characters', label: '① 角色形象' },
+  { key: 'scenes', label: '② 场景图' },
+  { key: 'props', label: '③ 道具图' },
+  { key: 'storyboards', label: '④ 分镜首尾帧' },
+  { key: 'storyboardVideos', label: '⑤ 分镜视频' },
+  { key: 'merge', label: '⑥ 合成成片' },
+] as const;
+const flowStep = ref<string>('');       // 当前流水线步骤 key
+const flowLabel = ref<string>('');      // 当前步骤文字
+const flowPercent = ref(0);             // 整剧/整集整体进度
+const flowTag = ref<string>('');        // 整剧成片时的当前集标签
+const flowIdx = computed(() => {
+  const i = PIPELINE_STEPS.findIndex((p) => p.key === flowStep.value);
+  return i < 0 ? -1 : i;
+});
+
 function addLog(level: string, text: string) {
-  logs.value.push({ level, text, at: Date.now(), id: ++logSeq.value });
+  logs.value.unshift({ level, text, at: Date.now(), id: ++logSeq.value });
   keepLogTail();
 }
 function keepLogTail() {
-  // 上限 500 行，并自动滚到底
-  if (logs.value.length > 500) logs.value.splice(0, logs.value.length - 500);
+  // 上限 500 行；倒序展示：最新在最上面，自动滚到顶
+  if (logs.value.length > 500) logs.value.length = 500;
   requestAnimationFrame(() => {
-    if (terminalEl.value) terminalEl.value.scrollTop = terminalEl.value.scrollHeight;
+    if (terminalEl.value) terminalEl.value.scrollTop = 0;
   });
 }
 
@@ -153,24 +171,6 @@ async function genSbVideo(force = false) {
     await generateApi.generateStoryboardVideo(sb.id, force);
   } catch (e: any) {
     assetBusy.value['sb-video'] = false;
-    ElMessage.error(e.message);
-  }
-}
-
-async function genSbAudio(force = false) {
-  const sb = selectedStoryboard.value;
-  if (!sb || assetBusy.value['sb-audio']) return;
-  assetBusy.value['sb-audio'] = true;
-  addLog('info', `[分镜#${sb.number}] 配音生成中（TTS）...`);
-  try {
-    const res = await generateApi.generateStoryboardAudio(sb.id, force);
-    if (res?.mocked) {
-      ElMessage.warning('模拟模式：未配置火山引擎 TTS 密钥，已跳过真实配音');
-    } else {
-      ElMessage.success('配音生成完成');
-    }
-  } catch (e: any) {
-    assetBusy.value['sb-audio'] = false;
     ElMessage.error(e.message);
   }
 }
@@ -315,17 +315,23 @@ function sbContext(exclude: string) {
   const sb = selectedStoryboard.value;
   if (!sb) return '';
   const f = sbForm;
-  const char = characters.value.find((c) => c.id === f.characterId);
+  const charIds = f.characterIds?.length ? f.characterIds : (f.characterId != null ? [f.characterId] : []);
+  const chars = characters.value.filter((c) => charIds.includes(c.id));
   const scene = scenes.value.find((s) => s.id === f.sceneId);
-  const prop = props.value.find((p) => p.id === f.propId);
+  const propIds = f.propIds?.length ? f.propIds : (f.propId != null ? [f.propId] : []);
+  const propsInFrame = props.value.filter((p) => propIds.includes(p.id));
   return [
     `剧名：${dramaTitle.value}`,
     episode.value?.title ? `本集：${episode.value.title}` : '',
     episode.value?.description ? `本集简介：${episode.value.description}` : '',
     `分镜序号：第 ${sb.number} 镜`,
-    char ? `出场角色：${char.name}（${char.roleLabel || '配角'}）` : '出场角色：无（旁白镜头）',
+    chars.length
+      ? `出场角色：${chars.map((c) => `${c.name}（${c.roleLabel || '配角'}）`).join('、')}`
+      : '出场角色：无（旁白镜头）',
     scene ? `场景：${scene.location}${scene.time ? `，${scene.time}` : ''}` : '',
-    prop ? `道具：${prop.name}${prop.type ? `（${prop.type}）` : ''}` : '',
+    propsInFrame.length
+      ? `道具：${propsInFrame.map((p) => `${p.name}${p.type ? `（${p.type}）` : ''}`).join('、')}`
+      : '',
     f.emotion ? `情绪：${EMOTION_LABELS[f.emotion] || f.emotion}` : '',
     f.duration ? `镜头时长：${f.duration} 秒` : '',
     exclude !== 'dialogue' && f.dialogue ? `对白：${f.dialogue}` : '',
@@ -338,7 +344,8 @@ function sbContext(exclude: string) {
 }
 function enrichSb(field: 'dialogue' | 'narration' | 'sceneDescription' | 'motionDescription' | 'imagePrompt' | 'videoPrompt', regenerate = false) {
   if (!selectedStoryboard.value) return;
-  const char = characters.value.find((c) => c.id === sbForm.characterId);
+  const charIds = sbForm.characterIds?.length ? sbForm.characterIds : (sbForm.characterId != null ? [sbForm.characterId] : []);
+  const char = charIds.length > 0 ? characters.value.find((c) => c.id === charIds[0]) : null;
   if (field === 'dialogue' && !char) {
     ElMessage.warning('旁白镜头请用「旁白」输入框，生成对白需先选择角色');
     return;
@@ -423,29 +430,37 @@ function defaultMergeCfg(): MergeConfig {
 }
 const mergeConfig = ref<MergeConfig>(defaultMergeCfg());
 
-/* ================= 生成一致性配置（genCfg：音轨语言 / 唱词） ================= */
-const genCfg = ref<GenConfig>({ language: 'zh-CN', allowSinging: false });
+/* ================= 生成一致性配置（genCfg：画面风格 / 音轨语言） ================= */
+const ART_STYLE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'cartoon', label: '2D 卡通动漫（推荐）' },
+  { value: 'anime2d', label: '日系二维动画' },
+  { value: 'anime3d', label: '3D 动画电影' },
+  { value: 'realistic', label: '写实真人' },
+  { value: 'watercolor', label: '国风水墨' },
+];
+const genCfg = ref<GenConfig>({ language: 'zh-CN', allowSinging: false, artStyle: 'cartoon' });
 function parseGenCfg(raw?: string | null): GenConfig {
+  const base: GenConfig = { language: 'zh-CN', allowSinging: false, artStyle: 'cartoon' };
   if (raw) {
     try {
-      return { language: 'zh-CN', allowSinging: false, ...JSON.parse(raw) };
+      return { ...base, ...JSON.parse(raw) };
     } catch {
       /* ignore */
     }
   }
-  return { language: 'zh-CN', allowSinging: false };
+  return base;
 }
 
 /* ================= 一键生成选项（分步勾选） ================= */
 const genDialog = reactive({ show: false });
+// 默认全流程勾选：一键成片 = 依次走完 角色→场景→道具→首尾帧→视频→合成
 const genSteps = reactive({
   characters: true,
   scenes: true,
   props: true,
   storyboardImages: true,
-  storyboardVideos: false,
-  storyboardAudio: false,
-  merge: false,
+  storyboardVideos: true,
+  merge: true,
 });
 const GEN_STEP_LABELS: Record<keyof typeof genSteps, string> = {
   characters: '① 角色形象',
@@ -453,16 +468,14 @@ const GEN_STEP_LABELS: Record<keyof typeof genSteps, string> = {
   props: '③ 道具图',
   storyboardImages: '④ 分镜首尾帧',
   storyboardVideos: '⑤ 分镜视频',
-  storyboardAudio: '⑥ 分镜配音',
-  merge: '⑦ 合成成片',
+  merge: '⑥ 合成成片',
 };
-// 勾选「合成成片」时自动补选视频/配音，避免空片段合成
+// 勾选「合成成片」时自动补选视频，避免空片段合成
 watch(
   () => genSteps.merge,
   (v) => {
     if (v) {
       genSteps.storyboardVideos = true;
-      genSteps.storyboardAudio = true;
     }
   },
 );
@@ -475,8 +488,10 @@ const sbForm = reactive({
   sceneDescription: '',
   motionDescription: '',
   characterId: null as number | null,
+  characterIds: [] as number[],
   sceneId: null as number | null,
   propId: null as number | null,
+  propIds: [] as number[],
   dialect: null as string | null,
   emotion: 'neutral',
   duration: 5,
@@ -499,8 +514,18 @@ function selectStoryboard(index: number) {
   sbForm.sceneDescription = sb.sceneDescription ?? '';
   sbForm.motionDescription = sb.motionDescription ?? '';
   sbForm.characterId = sb.characterId ?? null;
+  sbForm.characterIds = sb.characterIds?.length
+    ? [...sb.characterIds]
+    : sb.characterId != null
+      ? [sb.characterId]
+      : [];
   sbForm.sceneId = sb.sceneId ?? null;
   sbForm.propId = sb.propId ?? null;
+  sbForm.propIds = sb.propIds?.length
+    ? [...sb.propIds]
+    : sb.propId != null
+      ? [sb.propId]
+      : [];
   sbForm.dialect = sb.dialect ?? null;
   sbForm.emotion = sb.emotion ?? 'neutral';
   sbForm.duration = sb.duration ?? 5;
@@ -533,14 +558,19 @@ async function saveStoryboard(silent = false) {
     sbSaveTimer = null;
   }
   const id = selectedStoryboard.value.id;
+  // 多选为主：characterIds/propIds 作为新主数据；同时回写单值 characterId/propId 保持兼容
+  const charIds = sbForm.characterIds?.length ? sbForm.characterIds : (sbForm.characterId != null ? [sbForm.characterId] : []);
+  const propIds = sbForm.propIds?.length ? sbForm.propIds : (sbForm.propId != null ? [sbForm.propId] : []);
   const patch = {
     dialogue: sbForm.dialogue || null,
     narration: sbForm.narration || null,
     sceneDescription: sbForm.sceneDescription || null,
     motionDescription: sbForm.motionDescription || null,
-    characterId: sbForm.characterId,
+    characterId: charIds[0] ?? null,
+    characterIds: charIds,
     sceneId: sbForm.sceneId,
-    propId: sbForm.propId,
+    propId: propIds[0] ?? null,
+    propIds: propIds,
     dialect: sbForm.dialect,
     emotion: sbForm.emotion,
     duration: sbForm.duration,
@@ -630,6 +660,52 @@ async function removeStoryboard(sb: Storyboard) {
   }
 }
 
+/* ================= 分镜时间线：拖动排序 ================= */
+const dragIdx = ref(-1); // 当前被拖动的分镜下标
+const dragOverIdx = ref(-1); // 拖拽悬停目标下标
+const hoverSb = ref(-1); // 鼠标悬停的分镜下标（用于显示视频播放预览）
+
+function onSbDragStart(i: number) {
+  if (generating.value || regenSbRunning.value) return;
+  dragIdx.value = i;
+  dragOverIdx.value = -1;
+}
+function onSbDragOver(e: DragEvent, i: number) {
+  if (dragIdx.value < 0) return;
+  e.preventDefault();
+  if (i !== dragOverIdx.value) dragOverIdx.value = i;
+}
+function onSbDrop(i: number) {
+  const from = dragIdx.value;
+  dragIdx.value = -1;
+  dragOverIdx.value = -1;
+  if (from < 0 || from === i) return;
+  const arr = [...storyboards.value];
+  const [moved] = arr.splice(from, 1);
+  arr.splice(i, 0, moved);
+  const numbered = arr.map((s, idx) => ({ ...s, number: idx + 1 }));
+  storyboards.value = numbered;
+  // 同步选中下标，保持当前编辑分镜不变
+  if (selectedStoryboard.value) {
+    const ni = numbered.findIndex((s) => s.id === selectedStoryboard.value!.id);
+    if (ni >= 0) selectStoryboard(ni);
+  }
+  // 调用 reorder 持久化
+  storyboardApi
+    .reorder(episodeId, numbered.map((s) => s.id))
+    .then(() => {
+      addLog('info', `已调整分镜顺序，新顺序 #${numbered.map((s) => s.number).join(' → #')}`);
+    })
+    .catch((e: any) => {
+      ElMessage.error(`排序保存失败：${e.message}`);
+      reloadAssets();
+    });
+}
+function onSbDragEnd(i: number) {
+  dragIdx.value = -1;
+  dragOverIdx.value = -1;
+}
+
 /* ================= 方言解析（三级级联） ================= */
 function resolveDialect(sb: Storyboard) {
   if (sb.dialect && DIALECT_MAP[sb.dialect]) {
@@ -673,11 +749,45 @@ function handleEvent(data: string) {
     } else if (e.type === 'storyboard') {
       const d = e.data;
       const sb = storyboards.value.find((s) => s.id === d?.id);
-      if (sb) sb.status = d.status;
+      if (sb) {
+        sb.status = d.status ?? sb.status;
+        if (d.imageUrl) sb.imageUrl = d.imageUrl;           // 首帧实时显示
+        if (d.lastFrameUrl) sb.lastFrameUrl = d.lastFrameUrl; // 尾帧实时显示
+        if (d.videoUrl) sb.videoUrl = d.videoUrl;           // 视频实时可播放
+      }
+    } else if (e.type === 'asset') {
+      // 角色/场景/道具形象图生成完成：实时补到当前数据，无需刷新
+      const d = e.data;
+      if (d?.kind === 'character') {
+        const c = characters.value.find((x) => x.id === d.id);
+        if (c) {
+          c.imageUrl = d.imageUrl ?? c.imageUrl;
+          c.sourceUrl = d.sourceUrl ?? c.sourceUrl;
+        }
+      } else if (d?.kind === 'scene') {
+        const s = scenes.value.find((x) => x.id === d.id);
+        if (s) {
+          s.imageUrl = d.imageUrl ?? s.imageUrl;
+          s.sourceUrl = d.sourceUrl ?? s.sourceUrl;
+        }
+      } else if (d?.kind === 'prop') {
+        const p = props.value.find((x) => x.id === d.id);
+        if (p) {
+          p.imageUrl = d.imageUrl ?? p.imageUrl;
+          p.sourceUrl = d.sourceUrl ?? p.sourceUrl;
+        }
+      }
+    } else if (e.type === 'phase') {
+      const d = e.data;
+      flowStep.value = d?.stepId ?? '';
+      flowLabel.value = d?.stepLabel ?? '';
+      if (typeof d?.percent === 'number') flowPercent.value = d.percent;
+      flowTag.value = d?.episodeTitle ? `第 ${d?.episodeNumber ?? ''} 集「${d.episodeTitle}」` : '';
     } else if (e.type === 'merge') {
       mergeProgress.value = e.data?.progress ?? mergeProgress.value;
       if (mergeProgress.value >= 100) {
         mergeRunning.value = false;
+        flowPercent.value = 100;
         episode.value = {
           ...episode.value!,
           merged: true,
@@ -687,7 +797,11 @@ function handleEvent(data: string) {
       }
     } else if (e.type === 'done') {
       // asset 级任务结束不代表整集生成结束
-      if (e.data?.scope !== 'asset') generating.value = false;
+      if (e.data?.scope !== 'asset') {
+        generating.value = false;
+        flowStep.value = '';
+        flowLabel.value = '';
+      }
       clearBusy();
       reloadAssets();
       // 剧本拆解落库完成：复位状态，并引导衔接「一键生成」
@@ -716,21 +830,19 @@ function handleEvent(data: string) {
 /* ================= 生成控制 ================= */
 async function startGenerate() {
   if (generating.value) return;
-  if (storyboards.value.length === 0) {
-    addLog('warn', '请先添加分镜，再一键生成');
-    return;
-  }
+  // 分镜为空时不再拦截：后端会先自动拆解剧本再继续流水线（logs/进度图会展示当前步骤）
   genDialog.show = true;
 }
 async function confirmGenerate() {
   genDialog.show = false;
   generating.value = true;
   try {
-    // 先持久化一致性配置（音轨语言 / 唱词），再发起分步生成
+    // 先持久化一致性配置（画面风格 / 音轨语言），再发起分步生成
     await episodeApi.update(episodeId, {
       genCfg: JSON.stringify({
         language: genCfg.value.language,
         allowSinging: genCfg.value.allowSinging,
+        artStyle: genCfg.value.artStyle,
       }),
     });
     await generateApi.generateEpisode(episodeId, { ...genSteps });
@@ -740,7 +852,7 @@ async function confirmGenerate() {
   }
 }
 
-// 一键重新生成分镜素材：按当前剧本强制重做全部首尾帧 → 视频 → 配音
+// 一键重新生成分镜素材：按当前剧本强制重做全部首尾帧 → 视频
 const regenSbRunning = ref(false);
 async function regenerateStoryboards() {
   if (generating.value || regenSbRunning.value) return;
@@ -750,7 +862,7 @@ async function regenerateStoryboards() {
   }
   try {
     await ElMessageBox.confirm(
-      '将根据当前剧本重新生成全部分镜的首尾帧、分镜视频与配音（覆盖已有素材，耗时较长）。\n生成时会统一人物风格、音轨语言（中文）与唱词（默认禁止），确定继续？',
+      '将根据当前剧本重新生成全部分镜的首尾帧与分镜视频（覆盖已有素材，耗时较长）。\n生成时会统一人物风格与音轨语言（中文），确定继续？',
       '一键重新生成分镜素材',
       { type: 'warning', confirmButtonText: '重新生成', cancelButtonText: '取消' },
     );
@@ -785,6 +897,15 @@ async function startMerge() {
 
 function totalDuration() {
   return storyboards.value.reduce((s, x) => s + (x.duration ?? 0), 0).toFixed(1);
+}
+
+/** 分镜缩略图：优先首帧图，回退尾帧 */
+function sbThumb(sb: Storyboard): string {
+  return sb.imageUrl || sb.lastFrameUrl || '';
+}
+/** 分镜是否已生成视频（可播放预览） */
+function sbHasVideo(sb: Storyboard): boolean {
+  return !!sb.videoUrl;
 }
 
 /* ================= 资源管理（角色/场景/道具） ================= */
@@ -943,21 +1064,51 @@ async function removeResource(kind: StepKey, item: any) {
 }
 
 // 分镜关联资产（供关联卡片与生成提示词使用）
+// 多选：返回该分镜关联的所有角色/道具（优先 characterIds/propIds，回退单值）
+function charsOf(sb: Storyboard): Character[] {
+  const ids = sb.characterIds?.length
+    ? sb.characterIds
+    : sb.characterId != null
+      ? [sb.characterId]
+      : [];
+  return characters.value.filter((c) => ids.includes(c.id));
+}
 function charOf(sb: Storyboard) {
-  return characters.value.find((c) => c.id === sb.characterId) ?? null;
+  return charsOf(sb)[0] ?? null;
 }
 function sceneOf(sb: Storyboard) {
   return scenes.value.find((s) => s.id === sb.sceneId) ?? null;
 }
+function propsOf(sb: Storyboard): Prop[] {
+  const ids = sb.propIds?.length
+    ? sb.propIds
+    : sb.propId != null
+      ? [sb.propId]
+      : [];
+  return props.value.filter((p) => ids.includes(p.id));
+}
 function propOf(sb: Storyboard) {
-  return props.value.find((p) => p.id === sb.propId) ?? null;
+  return propsOf(sb)[0] ?? null;
+}
+
+/** 分镜列表里显示的出场角色名（多角色用顿号连接） */
+function sbCharacterNames(sb: Storyboard): string {
+  const names = charsOf(sb).map((c) => c.name);
+  if (names.length) return names.join('、');
+  return '旁白';
 }
 
 // 资源被分镜引用次数
 function usedBy(kind: StepKey, id: number) {
-  if (kind === 'characters') return storyboards.value.filter((s) => s.characterId === id).length;
+  if (kind === 'characters') {
+    return storyboards.value.filter((s) =>
+      (s.characterIds?.length ? s.characterIds : s.characterId != null ? [s.characterId] : []).includes(id),
+    ).length;
+  }
   if (kind === 'scenes') return storyboards.value.filter((s) => s.sceneId === id).length;
-  return storyboards.value.filter((s) => s.propId === id).length;
+  return storyboards.value.filter((s) =>
+    (s.propIds?.length ? s.propIds : s.propId != null ? [s.propId] : []).includes(id),
+  ).length;
 }
 
 /* ================= 参考图上传与描述提取 ================= */
@@ -1115,7 +1266,7 @@ function goBack() {
 async function resetEpisode() {
   try {
     await ElMessageBox.confirm(
-      '确定要重置本分集吗？\n本集的全部分镜、场景、道具记录及其全部生成素材（图片/视频/配音/成片）将被删除且不可恢复，本集不再使用的角色也会一并清理。\n随后将自动按剧本原文重新拆解生成角色、场景、道具与分镜。确定继续？',
+      '确定要重置本分集吗？\n本集的全部分镜、场景、道具记录及其全部生成素材（图片/视频/成片）将被删除且不可恢复，本集不再使用的角色也会一并清理。\n随后将自动按剧本原文重新拆解生成角色、场景、道具与分镜。确定继续？',
       '重置分集',
       { type: 'warning', confirmButtonText: '清空并重建', cancelButtonText: '取消' },
     );
@@ -1237,11 +1388,15 @@ const countFor = (k: StepKey) => {
 };
 
 onMounted(() => {
-  loadAll();
   connectLogStream();
-  if (route.query.generate === '1') {
-    addLog('info', '📌 已通过「一键生成」进入本集，请确认角色/场景/道具后开始生成');
-  }
+  flowStep.value = route.query.generate === '1' ? 'characters' : '';
+  loadAll().then(() => {
+    // 从分集列表「一键成片」进入：自动走全流程，进度在顶部流程图 / 下方日志实时可见
+    if (route.query.generate === '1' && !generating.value) {
+      addLog('info', '📌 检测到「一键成片」，已自动开始整集流水线，进度见顶部流程图');
+      confirmGenerate();
+    }
+  });
 });
 onBeforeUnmount(() => {
   if (source) source.close();
@@ -1275,11 +1430,42 @@ onBeforeUnmount(() => {
           <button class="lmd-btn-primary flex items-center gap-1.5" :disabled="generating" @click="startGenerate">
             <span v-if="generating" class="lmd-spinner" />
             <el-icon v-else :size="16"><MagicStick /></el-icon>
-            {{ generating ? '生成中...' : '一键生成' }}
+            {{ generating ? '生成中...' : '一键成片' }}
           </button>
         </div>
       </div>
     </header>
+
+    <!-- 成片进度流程图：实时高亮当前流水线步骤（SSE phase 事件驱动） -->
+    <section v-show="generating || flowStep" class="pipeline-box">
+      <div class="pipeline-inner">
+        <div class="pipeline-title">
+          <el-icon :size="15" style="color: var(--indigo)"><MagicStick /></el-icon>
+          <span>成片进度</span>
+          <span v-if="flowTag" class="pipeline-tag">{{ flowTag }}</span>
+          <span class="pipeline-percent">{{ flowPercent }}%</span>
+        </div>
+        <div class="pipeline-bar">
+          <div
+            v-for="(p, pi) in PIPELINE_STEPS"
+            :key="p.key"
+            class="pipeline-step"
+            :class="{
+              done: flowIdx > pi,
+              active: flowStep === p.key,
+            }"
+          >
+            <span class="pipeline-dot">{{ '①②③④⑤⑥'[pi] }}</span>
+            <span class="pipeline-label">{{ p.label }}</span>
+          </div>
+        </div>
+        <div class="pipeline-status">
+          <span v-if="flowLabel">{{ flowLabel }}进行中...</span>
+          <span v-else-if="generating">流水线启动中...</span>
+          <span v-else>等待生成</span>
+        </div>
+      </div>
+    </section>
 
     <!-- 流程步进条 -->
     <nav class="lmd-stepper">
@@ -1436,7 +1622,7 @@ onBeforeUnmount(() => {
           <div class="sb-list-head">
             <span class="panel-title" style="margin:0">分镜列表</span>
             <span class="muted">{{ totalDuration() }}s</span>
-            <button class="lmd-btn-ghost sm" :disabled="regenSbRunning || generating" title="按当前剧本强制重做全部分镜的首尾帧、视频与配音（统一人物风格/音轨语言/唱词）" @click="regenerateStoryboards">
+            <button class="lmd-btn-ghost sm" :disabled="regenSbRunning || generating" title="按当前剧本强制重做全部分镜的首尾帧与视频（统一人物风格/音轨语言）" @click="regenerateStoryboards">
               <span v-if="regenSbRunning" class="mini-spinner dark" />
               <el-icon v-else :size="13"><RefreshRight /></el-icon>{{ regenSbRunning ? '重新生成中...' : '重新生成素材' }}
             </button>
@@ -1446,17 +1632,37 @@ onBeforeUnmount(() => {
               v-for="(sb, i) in storyboards"
               :key="sb.id"
               class="sb-item"
-              :class="{ active: selectedSbIndex === i }"
+              :class="{ active: selectedSbIndex === i, dragging: dragIdx === i, 'drag-over': dragOverIdx === i }"
+              :draggable="!generating && !regenSbRunning"
               @click="selectStoryboard(i)"
+              @dragstart="onSbDragStart(i)"
+              @dragover="onSbDragOver($event, i)"
+              @drop.prevent="onSbDrop(i)"
+              @dragend="onSbDragEnd(i)"
+              @dragleave="dragOverIdx = -1"
+              @mouseenter="hoverSb = i"
+              @mouseleave="hoverSb = -1"
             >
+              <!-- 缩略图：首帧 + 悬停播放预览 -->
+              <div class="sb-thumb">
+                <img v-if="sbThumb(sb)" :src="sbThumb(sb)" :alt="`分镜 #${sb.number}`" loading="lazy" />
+                <div v-else class="sb-thumb-null">未生成素材</div>
+                <span v-if="sbHasVideo(sb)" class="sb-vid-badge"><el-icon :size="12"><VideoPlay /></el-icon></span>
+                <!-- 悬停浮层：加载分镜视频并自动播放预览 -->
+                <div v-if="hoverSb === i && sbHasVideo(sb)" class="sb-video-layer" @click.stop>
+                  <video :src="sb.videoUrl || undefined" autoplay muted loop playsinline controls />
+                  <span class="sb-preview-tip">▶ 播放预览中</span>
+                </div>
+                <button class="sb-grip" title="按住拖动排序" @click.stop>⠿</button>
+              </div>
               <div class="sb-item-top">
                 <span class="sb-num">#{{ sb.number }}</span>
-                <span class="sb-dur">{{ sb.duration }}s</span>
+                <span class="sb-dur"><el-icon :size="12"><VideoCamera /></el-icon>{{ sb.duration }}s</span>
                 <span class="badge" :class="statusMeta(sb.status).cls">{{ statusMeta(sb.status).text }}</span>
               </div>
               <p class="sb-dialogue">"{{ sb.dialogue || '（无对白）' }}"</p>
               <div class="sb-item-meta">
-                <span>{{ sb.characterName || '旁白' }}</span>
+                <span>{{ sbCharacterNames(sb) }}</span>
                 <span class="dot">·</span>
                 <span>{{ sb.sceneLocation || '无场景' }}</span>
                 <span class="dot">·</span>
@@ -1484,7 +1690,7 @@ onBeforeUnmount(() => {
           <div class="edit-grid">
             <div class="prompt-grid">
               <label class="prompt-item">
-                <span class="prompt-cap">对白（会被配音）
+                <span class="prompt-cap">对白
                   <span class="ai-actions">
                     <button type="button" class="ai-mini" :disabled="enrichBusy['sb:dialogue']" @click.prevent="enrichSb('dialogue')">
                       <span v-if="enrichBusy['sb:dialogue']" class="mini-spinner dark" />
@@ -1538,8 +1744,8 @@ onBeforeUnmount(() => {
             </div>
 
             <el-form label-position="top" class="edit-form">
-              <el-form-item label="角色">
-                <el-select v-model="sbForm.characterId" placeholder="无角色（旁白）" clearable style="width:100%">
+              <el-form-item label="角色（可多选）">
+                <el-select v-model="sbForm.characterIds" multiple placeholder="无角色（旁白）" clearable style="width:100%">
                   <el-option v-for="c in characters" :key="c.id" :value="c.id" :label="`${c.name}（${c.roleLabel || '配角'}）`" />
                 </el-select>
               </el-form-item>
@@ -1548,8 +1754,8 @@ onBeforeUnmount(() => {
                   <el-option v-for="s in scenes" :key="s.id" :value="s.id" :label="`${s.location}${s.time ? ' · ' + s.time : ''}`" />
                 </el-select>
               </el-form-item>
-              <el-form-item label="道具">
-                <el-select v-model="sbForm.propId" placeholder="无道具" clearable style="width:100%">
+              <el-form-item label="道具（可多选）">
+                <el-select v-model="sbForm.propIds" multiple placeholder="无道具" clearable style="width:100%">
                   <el-option v-for="p in props" :key="p.id" :value="p.id" :label="p.name" />
                 </el-select>
               </el-form-item>
@@ -1597,22 +1803,26 @@ onBeforeUnmount(() => {
               </div>
               <div class="assoc-card">
                 <div class="assoc-cap">角色</div>
-                <template v-if="charOf(selectedStoryboard)">
-                  <img v-if="charOf(selectedStoryboard)!.imageUrl" :src="charOf(selectedStoryboard)!.imageUrl || undefined" class="assoc-thumb" />
-                  <div class="assoc-info">
-                    <div class="assoc-name">{{ charOf(selectedStoryboard)!.name }}</div>
-                    <div class="assoc-sub">{{ charOf(selectedStoryboard)!.roleLabel || '配角' }}</div>
+                <template v-if="charsOf(selectedStoryboard).length">
+                  <div v-for="c in charsOf(selectedStoryboard)" :key="c.id" class="assoc-info multi">
+                    <img v-if="c.imageUrl" :src="c.imageUrl || undefined" class="assoc-thumb sm" />
+                    <div>
+                      <div class="assoc-name">{{ c.name }}</div>
+                      <div class="assoc-sub">{{ c.roleLabel || '配角' }}</div>
+                    </div>
                   </div>
                 </template>
                 <div v-else class="assoc-empty">无角色（旁白）</div>
               </div>
               <div class="assoc-card">
                 <div class="assoc-cap">道具</div>
-                <template v-if="propOf(selectedStoryboard)">
-                  <img v-if="propOf(selectedStoryboard)!.imageUrl" :src="propOf(selectedStoryboard)!.imageUrl || undefined" class="assoc-thumb" />
-                  <div class="assoc-info">
-                    <div class="assoc-name">{{ propOf(selectedStoryboard)!.name }}</div>
-                    <div class="assoc-sub">{{ propOf(selectedStoryboard)!.type || '未分类' }}</div>
+                <template v-if="propsOf(selectedStoryboard).length">
+                  <div v-for="p in propsOf(selectedStoryboard)" :key="p.id" class="assoc-info multi">
+                    <img v-if="p.imageUrl" :src="p.imageUrl || undefined" class="assoc-thumb sm" />
+                    <div>
+                      <div class="assoc-name">{{ p.name }}</div>
+                      <div class="assoc-sub">{{ p.type || '未分类' }}</div>
+                    </div>
                   </div>
                 </template>
                 <div v-else class="assoc-empty">未选择道具</div>
@@ -1760,10 +1970,6 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="gen-row">
-              <button class="lmd-btn-ghost" :disabled="!!assetBusy['sb-audio']" @click="genSbAudio(false)">
-                <span v-if="assetBusy['sb-audio']" class="mini-spinner dark" />
-                <el-icon v-else class="mr-1" :size="14"><Microphone /></el-icon>生成配音
-              </button>
               <button class="lmd-btn-ghost" :disabled="!!assetBusy['sb-image']" @click="genSbImage(!!selectedStoryboard.imageUrl)">
                 <span v-if="assetBusy['sb-image']" class="mini-spinner dark" />
                 <el-icon v-else class="mr-1" :size="14"><Picture /></el-icon>{{ selectedStoryboard.imageUrl ? '重新生成图片' : '生成图片' }}
@@ -1776,16 +1982,6 @@ onBeforeUnmount(() => {
                 <el-icon class="mr-1" :size="14"><RefreshRight /></el-icon>重新生成视频
               </button>
             </div>
-
-            <!-- 配音音轨状态 -->
-            <div class="audio-row" v-if="selectedStoryboard.audioUrl">
-              <span class="audio-tag"><el-icon class="mr-1" :size="12"><Microphone /></el-icon>已配音</span>
-              <audio :src="selectedStoryboard.audioUrl" controls preload="none" class="audio-player" />
-              <button class="lmd-btn-ghost sm" @click="genSbAudio(true)">重新配音</button>
-            </div>
-            <p class="muted audio-hint" v-else>
-              暂无配音音轨；点击「生成配音」用 TTS 为对白/旁白生成音轨（未配置火山引擎密钥时走模拟模式，保留原声）。
-            </p>
           </div>
         </div>
       </section>
@@ -2168,33 +2364,40 @@ onBeforeUnmount(() => {
       </template>
     </el-dialog>
 
-    <!-- 一键生成选项弹窗（分步勾选 + 全剧一致性配置） -->
-    <el-dialog v-model="genDialog.show" title="一键生成选项" width="540px">
+    <!-- 一键成片选项弹窗（分步勾选 + 全剧一致性配置） -->
+    <el-dialog v-model="genDialog.show" title="一键成片" width="540px">
       <div class="gen-dialog">
         <div class="gen-dialog-section">
-          <div class="gen-dialog-title">生成步骤（可勾选，默认素材四步）</div>
+          <div class="gen-dialog-title">生成步骤（默认全流程，一步成片）</div>
           <div class="gen-step-grid">
             <label v-for="(label, key) in GEN_STEP_LABELS" :key="key" class="gen-step-item">
               <el-checkbox v-model="genSteps[key as keyof typeof genSteps]" />
               <span>{{ label }}</span>
             </label>
           </div>
-          <p class="form-hint">勾选「合成成片」会自动补选分镜视频与配音，避免空片段合成；已生成的步骤默认跳过，可取消勾选以重做。</p>
+          <p class="form-hint">默认按最优顺序一键走完「角色 → 场景 → 道具 → 分镜首尾帧 → 分镜视频 → 合成成片」，已生成的步骤自动跳过；也可取消勾选只做某几步。</p>
         </div>
         <div class="gen-dialog-section">
-          <div class="gen-dialog-title">全剧一致性（人物风格 / 音轨语言 / 唱词）</div>
+          <div class="gen-dialog-title">全剧一致性（画面风格 / 音轨语言）</div>
           <el-form label-position="top">
+            <el-form-item label="画面风格">
+              <el-select v-model="genCfg.artStyle" style="width:100%">
+                <el-option
+                  v-for="opt in ART_STYLE_OPTIONS"
+                  :key="opt.value"
+                  :value="opt.value"
+                  :label="opt.label"
+                />
+              </el-select>
+              <p class="form-hint">作为硬性风格锚点注入角色/场景/分镜的生图与生视频提示词，全剧统一；切换风格后重新生成即可生效（旧素材不会自动重做）。</p>
+            </el-form-item>
             <el-form-item label="音轨 / 字幕语言">
               <el-select v-model="genCfg.language" filterable allow-create default-first-option style="width:100%">
                 <el-option value="zh-CN" label="中文普通话（推荐）" />
                 <el-option value="zh-yue" label="粤语" />
                 <el-option value="en-US" label="英语" />
               </el-select>
-              <p class="form-hint">生成时会把语言约束注入分镜画面与配音提示词，保证全片语言统一，避免出现外语/乱码发音。</p>
-            </el-form-item>
-            <el-form-item label="唱词">
-              <el-switch v-model="genCfg.allowSinging" active-text="允许唱词" inactive-text="禁止唱词（默认）" />
-              <p class="form-hint">为保证全片一致，默认禁止唱歌；开启后所有分镜统一允许唱词，风格保持一致。</p>
+              <p class="form-hint">生成时会把语言约束注入视频台词口播提示词，保证全片语言统一，避免出现外语对白。</p>
             </el-form-item>
           </el-form>
         </div>
@@ -2232,8 +2435,10 @@ onBeforeUnmount(() => {
             <el-table-column label="#" width="48">
               <template #default="{ $index }">{{ $index + 1 }}</template>
             </el-table-column>
-            <el-table-column prop="character" label="角色" width="90">
-              <template #default="{ row }">{{ row.character || '旁白' }}</template>
+            <el-table-column label="角色" width="120" show-overflow-tooltip>
+              <template #default="{ row }">
+                {{ row.characters?.length ? row.characters.join('、') : (row.character || '旁白') }}
+              </template>
             </el-table-column>
             <el-table-column prop="scene" label="场景" width="110" show-overflow-tooltip />
             <el-table-column prop="dialogue" label="对白" show-overflow-tooltip>
@@ -2279,6 +2484,35 @@ onBeforeUnmount(() => {
 /* 步进条 */
 .lmd-stepper { border-bottom: 1px solid var(--border); background: var(--card); padding: 10px 0; position: sticky; top: 67px; z-index: 20; }
 .lmd-stepper-inner { max-width: 1080px; margin: 0 auto; padding: 0 20px; display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* 成片进度流程图 */
+.pipeline-box { border-bottom: 1px solid var(--border); background: linear-gradient(180deg, #eef2ff, #fff); }
+.pipeline-inner { max-width: 1080px; margin: 0 auto; padding: 12px 20px; }
+.pipeline-title { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; color: var(--text); }
+.pipeline-tag { font-size: 12px; font-weight: 600; color: var(--indigo); background: var(--indigo-soft); padding: 2px 10px; border-radius: 999px; }
+.pipeline-percent { margin-left: auto; font-size: 13px; font-weight: 700; color: var(--indigo); }
+.pipeline-bar { display: flex; align-items: center; gap: 4px; margin-top: 10px; }
+.pipeline-step {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  position: relative; opacity: 0.45; transition: opacity .2s;
+}
+.pipeline-step:not(:last-child)::after {
+  content: ''; position: absolute; top: 12px; right: -2px; left: calc(50% + 14px);
+  height: 2px; background: var(--border);
+}
+.pipeline-step.active, .pipeline-step.done { opacity: 1; }
+.pipeline-step.active .pipeline-dot,
+.pipeline-step.done .pipeline-dot {
+  background: var(--indigo); color: #fff; box-shadow: 0 0 0 4px var(--indigo-soft);
+}
+.pipeline-dot {
+  width: 26px; height: 26px; border-radius: 50%; background: var(--screen-soft);
+  border: 1px solid var(--border); color: var(--text-2); font-size: 12px;
+  display: flex; align-items: center; justify-content: center; z-index: 1;
+}
+.pipeline-label { font-size: 11px; color: var(--text-2); white-space: nowrap; }
+.pipeline-step.active .pipeline-label { color: var(--indigo); font-weight: 700; }
+.pipeline-status { margin-top: 8px; font-size: 12px; color: var(--indigo); font-weight: 600; }
 .lmd-step {
   font-size: 14px; font-weight: 600; color: var(--text-2); cursor: pointer;
   padding: 7px 14px; border-radius: 999px; border: 1px solid rgba(99,102,241,0.25); background: var(--screen-soft);
@@ -2319,9 +2553,24 @@ onBeforeUnmount(() => {
 .sb-list { background: var(--card); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; position: sticky; top: 132px; max-height: 70vh; display: flex; flex-direction: column; }
 .sb-list-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--border); }
 .sb-list-body { overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
-.sb-item { position: relative; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; cursor: pointer; transition: all .2s; background: #fff; }
+.sb-item { position: relative; padding: 8px; border: 1px solid var(--border); border-radius: 12px; cursor: pointer; transition: all .2s; background: #fff; }
 .sb-item:hover { border-color: #c7d2fe; }
 .sb-item.active { background: var(--screen-soft); border-color: var(--indigo); }
+.sb-item[draggable="true"] { cursor: grab; }
+.sb-item[draggable="true"]:active { cursor: grabbing; }
+.sb-item.dragging { opacity: 0.55; border-style: dashed; }
+.sb-item.drag-over { border-color: var(--indigo); box-shadow: 0 0 0 2px var(--indigo-soft); transform: translateY(2px); }
+/* 分镜缩略图（时间线画布） */
+.sb-thumb { position: relative; aspect-ratio: 16 / 10; border-radius: 8px; overflow: hidden; background: #eef2f7; margin-bottom: 8px; display: flex; align-items: center; justify-content: center; }
+.sb-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.sb-thumb-null { color: var(--muted); font-size: 12px; }
+.sb-vid-badge { position: absolute; left: 6px; bottom: 6px; width: 22px; height: 22px; border-radius: 50%; background: rgba(0,0,0,0.55); color: #fff; display: flex; align-items: center; justify-content: center; }
+.sb-grip { position: absolute; right: 6px; top: 6px; width: 26px; height: 26px; border: none; background: rgba(255,255,255,0.85); border-radius: 6px; color: var(--text-2); cursor: grab; display: flex; align-items: center; justify-content: center; font-size: 16px; line-height: 1; opacity: 0; transition: opacity .2s; }
+.sb-item:hover .sb-grip { opacity: 1; }
+.sb-grip:active { cursor: grabbing; }
+.sb-video-layer { position: absolute; inset: 0; background: #000; z-index: 3; }
+.sb-video-layer video { width: 100%; height: 100%; object-fit: contain; }
+.sb-preview-tip { position: absolute; left: 50%; bottom: 6px; transform: translateX(-50%); font-size: 10px; color: #fff; background: rgba(0,0,0,0.6); padding: 1px 8px; border-radius: 999px; white-space: nowrap; pointer-events: none; }
 .sb-item-top { display: flex; align-items: center; gap: 6px; }
 .sb-num { font-weight: 700; color: var(--indigo); font-size: 13px; }
 .sb-dur { font-size: 11px; color: var(--muted); }
@@ -2345,10 +2594,6 @@ onBeforeUnmount(() => {
 .edit-form :deep(.el-form-item) { margin-bottom: 12px; }
 .assoc-label { font-size: 13px; color: var(--text-2); display: flex; align-items: center; gap: 8px; }
 .gen-row { display: flex; gap: 10px; flex-wrap: wrap; }
-.audio-row { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
-.audio-tag { display: inline-flex; align-items: center; font-size: 12px; color: var(--accent, #409eff); border: 1px solid var(--accent, #409eff); border-radius: 999px; padding: 2px 10px; }
-.audio-player { height: 34px; flex: 1; min-width: 200px; max-width: 360px; }
-.audio-hint { grid-column: 1 / -1; font-size: 12px; margin: 2px 0 0; }
 .lmd-btn-ghost.sm { padding: 4px 10px; font-size: 12px; }
 
 /* 分镜关联资产 */
@@ -2358,7 +2603,10 @@ onBeforeUnmount(() => {
 .assoc-card { position: relative; padding-top: 22px; }
 .assoc-cap { top: 6px; left: 10px; font-size: 11px; color: var(--muted); }
 .assoc-thumb { width: 40px; height: 40px; border-radius: 8px; object-fit: cover; flex-shrink: 0; background: var(--screen-soft); }
+.assoc-thumb.sm { width: 28px; height: 28px; border-radius: 6px; }
 .assoc-info { min-width: 0; }
+.assoc-info.multi { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.assoc-info.multi + .assoc-info.multi { margin-top: 6px; }
 .assoc-name { font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .assoc-sub { font-size: 11px; color: var(--muted); }
 .assoc-empty { font-size: 12px; color: var(--muted); }
@@ -2375,14 +2623,14 @@ onBeforeUnmount(() => {
 .prompt-item { display: block; }
 .prompt-cap { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--text-2); margin-bottom: 6px; }
 
-/* AI 生成 / 丰富 小按钮 */
+/* AI 生成 / 丰富 小按钮（橙色主色，醒目标记 AI 能力） */
 .ai-mini {
   display: inline-flex; align-items: center; gap: 4px; margin-left: auto;
-  font-size: 11px; font-weight: 600; color: var(--indigo); line-height: 1;
-  background: var(--screen-soft); border: 1px solid rgba(99,102,241,.35);
+  font-size: 11px; font-weight: 600; color: #c2410c; line-height: 1;
+  background: var(--orange-soft); border: 1px solid rgba(249, 115, 22, 0.4);
   border-radius: 999px; padding: 3px 9px; cursor: pointer; transition: all .2s; white-space: nowrap;
 }
-.ai-mini:hover { background: #e0e7ff; border-color: var(--indigo); }
+.ai-mini:hover { background: #ffedd5; border-color: var(--orange); }
 .ai-mini:disabled { cursor: progress; opacity: .7; }
 /* 按钮组：把多个 AI 操作收拢在标签右侧 */
 .ai-actions { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }

@@ -2,8 +2,22 @@ import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { join } from 'path';
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, appendFileSync } from 'fs';
 import { AppModule } from './app.module';
+
+// 崩溃兜底日志：进程被异常终止前把堆栈落盘，避免「无声消失」无法取证
+const crashLog = (kind: string, e: any) => {
+  try {
+    appendFileSync(
+      join(process.cwd(), 'crash.log'),
+      `\n[${new Date().toISOString()}] ${kind}: ${e?.stack ?? e}\n`,
+    );
+  } catch {
+    /* 兜底自身失败时只能放弃 */
+  }
+};
+process.on('uncaughtException', (e) => crashLog('uncaughtException', e));
+process.on('unhandledRejection', (e) => crashLog('unhandledRejection', e));
 
 // 素材根目录由 .env 指定（相对 backend 工作目录），确保目录存在
 const uploadDir = process.env.UPLOAD_DIR || '../data/uploads';

@@ -110,8 +110,10 @@ model Storyboard {
   episodeId    Int
   number       Int
   characterId  Int?
+  characterIds String?   // 多角色 JSON 数组字符串，如 "[1,2,3]"（分镜可多角色同框）
   sceneId      Int?
   propId       Int?
+  propIds      String?   // 多道具 JSON 数组字符串，如 "[1,2]"（分镜可多道具同现）
   dialogue     String?
   narration    String?
   sceneDescription String? // 分镜画面描述：本镜画面内容/机位/构图（注入生图提示词）

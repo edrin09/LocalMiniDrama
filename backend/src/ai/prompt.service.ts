@@ -4,13 +4,44 @@ import { AIProviderFactory } from './ai-provider.factory';
 // 提示词构建与角色视觉锚点（开发文档 §4.1 / §4.4）
 // 跨分镜一致性 = 首帧图内注入锚点 + 尾帧衔接，不再依赖多图参考排序。
 
-/** 全剧统一美术风格锚点 */
-export const STYLE_ANCHOR =
-  '国产可爱动画风格，中国人（东亚人种）形象，自然浅肤色，干净线条，柔和打光';
+/**
+ * 全局画面风格体系（genCfg.artStyle）。
+ * 风格词必须「够具体 + 带排除项」：只写「可爱动画」这类弱词时，
+ * 生图/生视频模型会自由发挥成 3D 或写实真人，导致全剧风格漂移。
+ */
+export const ART_STYLES: Record<string, { label: string; anchor: string }> = {
+  cartoon: {
+    label: '2D 卡通动漫',
+    anchor:
+      '2D卡通动漫风格，日系赛璐璐动画质感，清晰干净的线条描边，明亮大眼，扁平色块上色，柔和阴影，色彩明快饱和，非写实真人、非3D渲染、非照片质感',
+  },
+  anime2d: {
+    label: '日系二维动画',
+    anchor:
+      '日系二维动画风格，赛璐璐上色，精致线稿，动漫比例大眼，柔和渐变光影，非写实真人、非3D渲染',
+  },
+  anime3d: {
+    label: '3D 动画电影',
+    anchor:
+      '3D动画电影风格，皮克斯质感，圆润角色建模，卡通渲染三转二着色，柔和全局光照，非写实真人',
+  },
+  realistic: {
+    label: '写实真人',
+    anchor:
+      '写实真人电影质感，自然光影，真实皮肤与材质细节，电影级摄影，浅景深',
+  },
+  watercolor: {
+    label: '国风水墨',
+    anchor:
+      '中国风水墨动画风格，水墨晕染笔触，留白构图，淡彩点染，意境悠远',
+  },
+};
 
-/** 服饰词需剔除：锁定核心面部与发型，避免跨分镜衣服漂移 */
-const CLOTHING_PATTERN =
-  /(Wearing|Dressed in|wearing|dressed in|穿着|身穿|身着|上衣|裤子|裙子|连衣裙|西装|T恤|外套|鞋子|帽子|服饰)[^,，。;；]*/g;
+/** 按风格配置取风格锚点（未知值回退卡通，即用户默认要的「卡通人物」） */
+export function styleAnchorOf(style?: GenStyle): string {
+  const key = style?.artStyle;
+  return (key && ART_STYLES[key]?.anchor) || ART_STYLES.cartoon.anchor;
+}
 
 export interface CharacterLike {
   name: string;
@@ -53,15 +84,22 @@ export interface GenStyle {
   language?: string;
   /** 是否允许唱词（默认 false = 禁止唱歌，保证全剧一致） */
   allowSinging?: boolean;
+  /** 画面风格：cartoon（默认）| anime2d | anime3d | realistic | watercolor */
+  artStyle?: string;
 }
 
-/** 语言一致性约束：注入生图/生视频提示词，杜绝外语/乱码语音 */
+/** 锚点内嵌的风格标记：切换风格后自动触发锚点重建；a2 = 保留服饰的锚点版本 */
+export function anchorStyleTag(style?: GenStyle): string {
+  return `【风格:${style?.artStyle || 'cartoon'}|a2】`;
+}
+
+/** 语言一致性约束（针对音轨与口型，覆盖角色对白与旁白，不再提及“画面文字”，避免诱导模型烧字） */
 export function languageConstraint(style?: GenStyle): string {
   const lang = style?.language || 'zh-CN';
   if (lang === 'zh-CN') {
-    return '画面中出现的台词、字幕、文字必须为中文普通话，禁止外语、乱码、非中文发音';
+    return '本镜所有语音（角色对白、旁白口播）必须用标准中文普通话清晰朗读，口型与中文语音匹配，禁止英语、方言或外语发音';
   }
-  return `画面中出现的台词、字幕、文字必须使用指定语言（${lang}），保持全片一致`;
+  return `本镜所有语音（角色对白、旁白口播）必须使用指定语言（${lang}）朗读，口型与语音匹配，保持全片一致`;
 }
 
 /** 唱词一致性约束：默认禁止唱歌，保证各分镜音轨统一 */
@@ -80,58 +118,73 @@ export class PromptService {
 
   // ==================== 视觉锚点 ====================
 
-  /** 剔除服饰词，锁定面部与发型 */
-  stripClothing(text: string): string {
-    return (text || '')
-      .replace(CLOTHING_PATTERN, '')
-      .replace(/[，,]\s*(?=[，,])/g, '')
-      .replace(/\s{2,}/g, ' ')
-      .replace(/^[，,、\s]+|[，,、\s]+$/g, '')
-      .trim();
-  }
-
   /**
-   * 提炼 6 层视觉锚点：优先文本模型润色，失败则本地规则兜底。
-   * 返回可直接注入提示词的自然语言锚点串。
+   * 提炼角色视觉锚点：优先文本模型润色，失败则用外貌原文兜底。
+   * 服饰与标志性配饰（帽子/眼镜等）是跨分镜一致性的关键，必须保留——
+   * 之前把服饰词剔除导致立绘与分镜帧服装各自漂移（蓝马甲→灰盔甲）。
+   * 返回可直接注入提示词的自然语言锚点串（头部带风格标记与风格锚点）。
    */
-  async buildCharacterAnchorText(c: CharacterLike): Promise<string> {
-    const base = this.stripClothing(c.appearance || '');
-    if (!base) return STYLE_ANCHOR;
+  async buildCharacterAnchorText(
+    c: CharacterLike,
+    style?: GenStyle,
+  ): Promise<string> {
+    const anchor = styleAnchorOf(style);
+    const tag = anchorStyleTag(style);
+    const base = (c.appearance || '').trim();
+    if (!base) return `${tag}${anchor}`;
 
     if (this.factory.isLive('text')) {
       try {
         const provider = this.factory.resolve('text');
         const res = await provider.generate('text', {
           prompt:
-            `把以下角色外貌描述整理为 6 层视觉锚点（面部轮廓 / 发型发色 / 五官细节 / 体型体态 / 主色配色 / 标志性气质），` +
-            `去除所有服饰与临时装饰词，只保留跨镜头必须保持一致的特征。` +
+            `把以下角色外貌描述整理为 6 层视觉锚点（面部轮廓 / 发型发色 / 五官细节 / 体型体态 / 服装与主色配色 / 标志性配饰与气质）。` +
+            `服装（颜色与款式）和标志性配饰（帽子、眼镜、饰品等）是角色跨镜头身份识别的一部分，必须原样保留、不得省略或改写颜色。` +
             `每行一条，格式「层名：描述」，不要多余解释。\n\n角色：${c.name}\n外貌：${base}`,
         });
         if (res.text && res.text.length > 10) {
-          return `${STYLE_ANCHOR}；${res.text.replace(/\n+/g, '；').trim()}`;
+          return `${tag}${anchor}；${res.text.replace(/\n+/g, '；').trim()}`;
         }
       } catch (e: any) {
         this.logger.warn(`锚点提炼失败，使用本地兜底：${e.message}`);
       }
     }
-    return `${STYLE_ANCHOR}；${base}`;
+    return `${tag}${anchor}；${base}`;
+  }
+
+  /** 按形象图实际内容生成锚点（生成后回读，保证锚点与立绘完全一致） */
+  anchorFromDescription(desc: string, style?: GenStyle): string {
+    const text = (desc || '').trim();
+    if (!text) return '';
+    return `${anchorStyleTag(style)}${styleAnchorOf(style)}；${text}`;
+  }
+
+  /** 角色锚点文案：锚点缺失时直接用外貌原文（含服饰），不再剔除服饰词 */
+  anchorTextOf(c: CharacterLike): string {
+    return (c.anchors || c.appearance || '').trim();
   }
 
   // ==================== 素材提示词 ====================
 
-  characterImagePrompt(c: CharacterLike): string {
-    const anchors = c.anchors || this.stripClothing(c.appearance || '');
+  characterImagePrompt(c: CharacterLike, style?: GenStyle): string {
+    const anchors = this.anchorTextOf(c);
     const parts = [
-      STYLE_ANCHOR,
+      styleAnchorOf(style),
       `角色名：${c.name}`,
       c.roleLabel ? `身份定位：${c.roleLabel}` : '',
-      anchors ? `外貌锚点：${anchors}` : '',
-      '竖版人物立绘，居中构图，半身像，纯色简洁背景，高细节',
+      anchors ? `外貌与服装锚点：${anchors}` : '',
+      '竖版人物立绘，居中构图，半身像，服装颜色与款式清晰完整，纯色简洁背景，高细节',
+      '画面中不出现任何文字、水印',
     ].filter(Boolean);
     return parts.join('，');
   }
 
-  sceneImagePrompt(s: SceneLike, quad: boolean): string {
+  sceneImagePrompt(
+    s: SceneLike,
+    quad: boolean,
+    style?: GenStyle,
+    charCtx?: string,
+  ): string {
     const body = [
       s.prompt?.trim(),
       s.description?.trim(),
@@ -139,7 +192,11 @@ export class PromptService {
     ]
       .filter(Boolean)
       .join('；');
-    const base = `${STYLE_ANCHOR}，场景概念图，${body}，电影级构图，环境光自然，高视觉密度`;
+    // 角色名词歧义消解：蛋蛋这类昵称必须明确是「人名」而非「物体」，防止场景图把角色渲染成同名实物
+    const disamb = charCtx
+      ? `。以下是本剧角色的人名/昵称（仅用于指代人物，不是物体名词，绝不可把它们画成鸡蛋/物件等同名实物）：${charCtx}`
+      : '';
+    const base = `${styleAnchorOf(style)}，场景概念图，${body}${disamb}，电影级构图，环境光自然，高视觉密度，画面中不出现任何文字、水印`;
     if (!quad) return `${base}，单张完整场景图，无人物或仅远景小人物`;
     return (
       `${base}，四宫格分镜参考图：2x2 排列，四个格子分别为同一场景的正面平视、侧面平视、俯视、仰视四个视角，` +
@@ -147,11 +204,15 @@ export class PromptService {
     );
   }
 
-  propImagePrompt(p: PropLike, quad: boolean): string {
+  propImagePrompt(p: PropLike, quad: boolean, style?: GenStyle, charCtx?: string): string {
     const body = [p.prompt?.trim(), p.description?.trim(), `${p.name}${p.type ? `（${p.type}）` : ''}`]
       .filter(Boolean)
       .join('；');
-    const base = `${STYLE_ANCHOR}，道具设定图，${body}，纯色无缝背景，主体居中，清晰轮廓，高细节`;
+    // 同上：道具名/描述若与角色昵称相同，必须按人消歧，勿画成同名实物
+    const disamb = charCtx
+      ? `。注意：以下本剧角色的人名/昵称是人物，不是实物（如「蛋蛋」是人不是鸡蛋），道具设定图若含上述字词一律按人物处理，不得画成同名物体：${charCtx}`
+      : '';
+    const base = `${styleAnchorOf(style)}，道具设定图，${body}${disamb}，纯色无缝背景，主体居中，清晰轮廓，高细节，画面中不出现任何文字、水印`;
     if (!quad) return base;
     return (
       `${base}，四视图道具图：2x2 排列，分别为正面、侧面、背面、45度斜视角四个视图，` +
@@ -162,86 +223,181 @@ export class PromptService {
   // ==================== 分镜提示词 ====================
 
   /**
-   * 分镜首帧：把角色锚点 + 场景 + 道具全部注入画面内，
+   * 分镜首帧：把角色锚点（含服装）+ 场景 + 道具全部注入画面内，
    * 靠这张图保证后续视频里的人物一致性。
+   * - 服装颜色与款式显式锁定到角色形象参考图（此前只锁面部/发型，服装随意漂移）
+   * - refNames：随请求附上的角色形象参考图对应角色名（按顺序），用于声明参考图与角色的对应关系
+   * 注意：台词绝不以文字形式出现在画面里（画字=乱码），只描述说话神态。
    */
   storyboardImagePrompt(
     ctx: {
       sb: StoryboardLike;
       character?: CharacterLike | null;
+      characters?: CharacterLike[] | null;
       scene?: SceneLike | null;
       prop?: PropLike | null;
+      props?: PropLike[] | null;
+      refNames?: string[] | null;
+      hasTailRef?: boolean;
     },
     style?: GenStyle,
   ): string {
-    const { sb, character, scene, prop } = ctx;
+    const { sb, character, characters, scene, prop, props, refNames, hasTailRef } = ctx;
     const custom = sb.imagePrompt?.trim();
+
+    // 归一化角色列表：优先 characters，回退单值 character
+    const charList: CharacterLike[] = characters?.length
+      ? characters
+      : character
+        ? [character]
+        : [];
+    const propList: PropLike[] = props?.length ? props : prop ? [prop] : [];
+    const refNameList = refNames || [];
+
+    // 角色主体描述：多角色逐个锁定；服装与配色必须与形象参考图一致
+    const charDesc = charList.length
+      ? charList
+          .map((c) => {
+            const refIdx = refNameList.indexOf(c.name);
+            const refNote =
+              refIdx >= 0 ? `（其形象立绘为参考图第 ${refIdx + 1} 张）` : '';
+            return (
+              `角色「${c.name}」：${this.anchorTextOf(c)}，` +
+              `其面部五官、发型发色、体型以及服装的颜色与款式必须与其形象参考图完全一致，不得更换服装、不得改变服装颜色${refNote}`
+            );
+          })
+          .join('；')
+      : '画面无人物主体，纯环境与氛围';
+
+    const propDesc = propList.length
+      ? `画面中出现道具：${propList
+          .map((p) => `${p.name}${p.description ? `（${p.description}）` : ''}`)
+          .join('、')}`
+      : '';
+
+    const refNote =
+      refNameList.length > 0
+        ? hasTailRef
+          ? `所附参考图按顺序依次为上述角色的形象立绘（最后一张为上一镜画面衔接参考，非角色形象），人物外貌与服装以角色形象立绘为准`
+          : '所附参考图按顺序依次为上述角色的形象立绘，人物外貌与服装以参考图为准'
+        : '';
+
     const composed = [
-      STYLE_ANCHOR,
-      character
-        ? `画面主体角色：${character.name}，${character.anchors || this.stripClothing(character.appearance || '')}`
-        : '画面无人物主体，纯环境与氛围',
+      styleAnchorOf(style),
+      charDesc,
       scene
         ? `场景：${scene.location}${scene.time ? `，${scene.time}` : ''}${scene.description ? `，${scene.description}` : ''}`
         : '',
       sb.sceneDescription?.trim() ? `画面描述：${sb.sceneDescription.trim()}` : '',
       sb.motionDescription?.trim() ? `动作描述：${sb.motionDescription.trim()}` : '',
-      prop ? `画面中出现道具：${prop.name}${prop.description ? `，${prop.description}` : ''}` : '',
-      sb.dialogue ? `人物正在说：「${sb.dialogue}」` : '',
-      sb.narration ? `画面氛围对应旁白：${sb.narration}` : '',
+      propDesc,
+      sb.dialogue ? '角色正在张口说话的神态与表情（画面中不出现台词文字）' : '',
+      sb.narration ? `画面氛围：${sb.narration}` : '',
       EMOTION_HINT[sb.emotion || ''] ?? '',
-      languageConstraint(style),
+      '画面中严禁出现任何文字、字幕、对话气泡、水印、招牌字',
       '电影级构图，主体清晰，适合作为视频首帧，高细节',
-    ].filter(Boolean);
+    ]
+      .filter(Boolean)
+      .concat(refNote ? [refNote] : []);
 
     return custom ? `${custom}；${composed.join('，')}` : composed.join('，');
   }
 
-  /** 尾帧：与首帧同一场景与人物，呈现动作后的结束状态 */
-  storyboardLastFramePrompt(ctx: {
-    sb: StoryboardLike;
-    character?: CharacterLike | null;
-    scene?: SceneLike | null;
-  }): string {
-    const { sb, character, scene } = ctx;
+  /** 尾帧：与首帧同一场景与人物（含服装），呈现动作后的结束状态 */
+  storyboardLastFramePrompt(
+    ctx: {
+      sb: StoryboardLike;
+      character?: CharacterLike | null;
+      characters?: CharacterLike[] | null;
+      scene?: SceneLike | null;
+    },
+    style?: GenStyle,
+  ): string {
+    const { sb, character, characters, scene } = ctx;
+    const charList: CharacterLike[] = characters?.length
+      ? characters
+      : character
+        ? [character]
+        : [];
+    const charDesc = charList.length
+      ? charList
+          .map((c) => `同一角色「${c.name}」：${this.anchorTextOf(c)}，面部、发型、体型以及服装的颜色与款式必须与首帧保持完全一致`)
+          .join('；')
+      : '同一环境，无人物主体';
     return [
-      STYLE_ANCHOR,
-      character
-        ? `同一角色：${character.name}，${character.anchors || this.stripClothing(character.appearance || '')}，面部与发型必须与参考图完全一致`
-        : '同一环境，无人物主体',
+      styleAnchorOf(style),
+      charDesc,
       scene ? `同一场景：${scene.location}` : '',
-      sb.dialogue ? `对白「${sb.dialogue}」说完后的收尾姿态` : '镜头自然收束的结束状态',
-      '与参考图为同一场景同一人物，仅姿态与镜头推进发生变化，构图稳定，高细节',
+      sb.dialogue ? '对白说完后的收尾姿态与神态' : '镜头自然收束的结束状态',
+      '与首帧为同一场景同一人物，服装颜色与款式不变，仅姿态与镜头推进发生变化，构图稳定，高细节',
+      '画面中严禁出现任何文字、字幕、对话气泡、水印',
     ]
       .filter(Boolean)
       .join('，');
   }
 
-  /** 视频提示词：硬约束要求人物外貌整段不变，并统一音轨语言与唱词 */
+  /**
+   * 视频提示词：画面由首帧(keyframe)或参考图(reference)锁定，
+   * 文本只负责「动作 + 运镜 + 台语言语」——塞太多约束反而稀释关键指令。
+   * - keyframe 模式：首帧已锁定画面，不再重复外貌长串
+   * - reference 模式：用 <Picture N> 指代角色形象参考图
+   * - text 模式：无图可依，注入外貌锚点兜底
+   * 旁白不进视频提示词（留给后期配音/字幕），只有对白作为口播台词。
+   */
   videoPrompt(
     ctx: {
       sb: StoryboardLike;
       character?: CharacterLike | null;
+      characters?: CharacterLike[] | null;
       scene?: SceneLike | null;
     },
     style?: GenStyle,
+    refNames: string[] = [],
   ): string {
-    const { sb, character, scene } = ctx;
+    const { sb, character, characters, scene } = ctx;
     const custom = sb.videoPrompt?.trim();
+    const charList: CharacterLike[] = characters?.length
+      ? characters
+      : character
+        ? [character]
+        : [];
+
+    // 锁定约束：三种模式各写各的，避免重复堆叠
+    let lock: string;
+    if (refNames.length > 0) {
+      lock =
+        `硬约束：` +
+        charList
+          .map((c, i) => {
+            const pic = i < refNames.length ? `<Picture ${i + 1}>` : '';
+            return `${pic}是角色「${c.name}」的形象参考，其面部、发型、体型与服装在整段视频中与参考完全一致，不得换脸、不得变形`;
+          })
+          .join('；');
+    } else if (charList.length > 0) {
+      lock =
+        `硬约束：` +
+        charList
+          .map((c) => `${c.name}的面部、发型、体型与服装在整段视频中保持完全不变，不得换脸、不得变形`)
+          .join('；') +
+        `；角色外貌：${charList.map((c) => `${c.name}（${this.anchorTextOf(c)}）`).join('；')}`;
+    } else {
+      lock = '硬约束：画面构图与场景元素在整段视频中保持稳定';
+    }
+
     const composed = [
-      character
-        ? `硬约束：画面中的${character.name}的面部、发型、体型与服装在整段视频中保持完全不变，不得换脸、不得变形`
-        : '硬约束：画面构图与场景元素在整段视频中保持稳定',
-      character ? `角色外貌：${character.anchors || this.stripClothing(character.appearance || '')}` : '',
+      lock,
       scene ? `场景：${scene.location}${scene.time ? `，${scene.time}` : ''}` : '',
-      sb.sceneDescription?.trim() ? `画面描述：${sb.sceneDescription.trim()}` : '',
+      sb.sceneDescription?.trim() ? `画面：${sb.sceneDescription.trim()}` : '',
       sb.motionDescription?.trim() ? `动作与运镜：${sb.motionDescription.trim()}` : '',
-      sb.narration || sb.dialogue || '镜头自然推进，轻微运动',
+      sb.dialogue
+        ? `角色台词（口播）：「${sb.dialogue}」`
+        : sb.narration?.trim()
+          ? `旁白口播（标准中文普通话，作为画外音男声清晰朗读）：「${sb.narration.trim()}」`
+          : '镜头自然推进，轻微运动',
       EMOTION_HINT[sb.emotion || ''] ?? '',
       languageConstraint(style),
       singingConstraint(style),
-      '构图约束：竖屏 9:16 满屏人像构图，禁止横屏/宽幅/分屏/16:9',
-      '镜头稳定，电影级运镜，画面连贯不跳切',
+      '竖屏 9:16 满幅构图，禁止横屏、宽幅、分屏、黑边',
     ].filter(Boolean);
     return custom ? `${custom}；${composed.join('，')}` : composed.join('，');
   }
@@ -250,11 +406,13 @@ export class PromptService {
 
   /** 参考图描述提取任务（角色外貌 / 场景 / 道具） */
   private static readonly DESCRIBE_TASKS: Record<
-    'character' | 'scene' | 'prop',
+    'character' | 'characterPortrait' | 'scene' | 'prop',
     string
   > = {
     character:
       '请观察这张人物参考图，提取外貌特征：性别与年龄段、发型发色、五官特点、体型体态、整体气质；忽略服饰与背景。输出一段 80 字以内的中文外貌描述，可直接用于 AI 生成人物形象，不要任何前缀和解释。',
+    characterPortrait:
+      '请观察这张人物立绘，提取跨镜头必须保持一致的全部视觉特征：性别与年龄段、发型发色、五官与脸型、体型体态、服装的颜色与款式、标志性配饰（帽子/眼镜/饰品等）。输出一段 100 字以内的中文描述，服装颜色必须写明（如「黄色T恤」「蓝色马甲」），可直接用于 AI 生成同一人物的画面，不要任何前缀和解释。',
     scene:
       '请观察这张场景参考图，提取场景信息：地点类型、时间与光线、主要环境元素、色调与氛围。输出一段 80 字以内的中文场景描述，可直接用于 AI 生成场景图，不要任何前缀和解释。',
     prop:
@@ -267,7 +425,7 @@ export class PromptService {
    */
   async describeImage(
     dataUri: string,
-    kind: 'character' | 'scene' | 'prop',
+    kind: 'character' | 'characterPortrait' | 'scene' | 'prop',
   ): Promise<string | null> {
     if (!this.factory.isLive('text')) {
       this.logger.warn('文本模型未配置 Key，无法提取参考图描述');

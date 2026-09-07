@@ -94,16 +94,27 @@ export class ScriptService {
       where: { id, deletedAt: null },
     });
     if (!exist) throw new NotFoundException(`角色 ${id} 不存在`);
-    await this.prisma.$transaction([
-      this.prisma.storyboard.updateMany({
-        where: { characterId: id, deletedAt: null },
-        data: { characterId: null },
-      }),
-      this.prisma.character.update({
-        where: { id },
-        data: { deletedAt: new Date() },
-      }),
-    ]);
+    // 清空单值引用
+    await this.prisma.storyboard.updateMany({
+      where: { characterId: id, deletedAt: null },
+      data: { characterId: null },
+    });
+    // 从多角色 JSON 数组中移除该 id
+    const multi = await this.prisma.storyboard.findMany({
+      where: { deletedAt: null, characterIds: { not: null } },
+      select: { id: true, characterIds: true },
+    });
+    for (const sb of multi) {
+      const ids = this.jsonToIds(sb.characterIds).filter((v) => v !== id);
+      await this.prisma.storyboard.update({
+        where: { id: sb.id },
+        data: { characterIds: this.idsToJson(ids) },
+      });
+    }
+    await this.prisma.character.update({
+      where: { id },
+      data: { deletedAt: new Date() },
+    });
     return { id, deleted: true };
   }
 
@@ -258,20 +269,54 @@ export class ScriptService {
       where: { id, deletedAt: null },
     });
     if (!exist) throw new NotFoundException(`道具 ${id} 不存在`);
-    await this.prisma.$transaction([
-      this.prisma.storyboard.updateMany({
-        where: { propId: id, deletedAt: null },
-        data: { propId: null },
-      }),
-      this.prisma.prop.update({
-        where: { id },
-        data: { deletedAt: new Date() },
-      }),
-    ]);
+    // 清空单值引用
+    await this.prisma.storyboard.updateMany({
+      where: { propId: id, deletedAt: null },
+      data: { propId: null },
+    });
+    // 从多道具 JSON 数组中移除该 id
+    const multi = await this.prisma.storyboard.findMany({
+      where: { deletedAt: null, propIds: { not: null } },
+      select: { id: true, propIds: true },
+    });
+    for (const sb of multi) {
+      const ids = this.jsonToIds(sb.propIds).filter((v) => v !== id);
+      await this.prisma.storyboard.update({
+        where: { id: sb.id },
+        data: { propIds: this.idsToJson(ids) },
+      });
+    }
+    await this.prisma.prop.update({
+      where: { id },
+      data: { deletedAt: new Date() },
+    });
     return { id, deleted: true };
   }
 
   // ==================== 分镜（分集归属） ====================
+
+  /** 数字数组 → JSON 字符串（空数组返回 null，避免存 "[]" 造成语义歧义） */
+  private idsToJson(ids?: number[] | null): string | null {
+    if (!Array.isArray(ids)) return null;
+    const cleaned = [...new Set(ids.filter((v) => Number.isInteger(v)))];
+    return cleaned.length > 0 ? JSON.stringify(cleaned) : null;
+  }
+
+  /** JSON 字符串 → 数字数组（容错解析） */
+  private jsonToIds(json?: string | null): number[] {
+    if (!json) return [];
+    try {
+      const arr = JSON.parse(json);
+      if (!Array.isArray(arr)) return [];
+      return arr.filter((v) => Number.isInteger(v));
+    } catch {
+      // 兼容旧的逗号分隔格式
+      return json
+        .split(',')
+        .map((s) => Number(s.trim()))
+        .filter((v) => Number.isInteger(v));
+    }
+  }
 
   async listStoryboards(episodeId?: number) {
     const rows = await this.prisma.storyboard.findMany({
@@ -284,12 +329,14 @@ export class ScriptService {
       },
     });
     return rows.map(
-      ({ character, scene, prop, deletedAt, episodeId, ...rtn }) => ({
+      ({ character, scene, prop, characterIds, propIds, deletedAt, episodeId, ...rtn }) => ({
         ...rtn,
         characterName: character?.name ?? null,
         sceneLocation: scene?.location ?? null,
         sceneTime: scene?.time ?? null,
         propName: prop?.name ?? null,
+        characterIds: this.jsonToIds(characterIds),
+        propIds: this.jsonToIds(propIds),
       }),
     );
   }
@@ -301,13 +348,15 @@ export class ScriptService {
       _max: { number: true },
     });
     const number = dto.number ?? (max._max.number ?? 0) + 1;
-    return this.prisma.storyboard.create({
+    const created = await this.prisma.storyboard.create({
       data: {
         episodeId: dto.episodeId,
         number,
         characterId: dto.characterId ?? null,
+        characterIds: this.idsToJson(dto.characterIds),
         sceneId: dto.sceneId ?? null,
         propId: dto.propId ?? null,
+        propIds: this.idsToJson(dto.propIds),
         dialogue: dto.dialogue ?? null,
         narration: dto.narration ?? null,
         sceneDescription: dto.sceneDescription ?? null,
@@ -319,18 +368,24 @@ export class ScriptService {
         status: dto.status ?? 'pending',
       },
     });
+    return {
+      ...created,
+      characterIds: this.jsonToIds(created.characterIds),
+      propIds: this.jsonToIds(created.propIds),
+    };
   }
 
-  async updateStoryboard(id: number, dto: UpdateStoryboardDto) {
-    const exist = await this.prisma.storyboard.findFirst({
+  async updateStoryboard(id: number, dto: UpdateStoryboardDto) {    const exist = await this.prisma.storyboard.findFirst({
       where: { id, deletedAt: null },
     });
     if (!exist) throw new NotFoundException(`分镜 ${id} 不存在`);
     const data: any = {};
     if (dto.number !== undefined) data.number = dto.number;
     if (dto.characterId !== undefined) data.characterId = dto.characterId;
+    if (dto.characterIds !== undefined) data.characterIds = this.idsToJson(dto.characterIds);
     if (dto.sceneId !== undefined) data.sceneId = dto.sceneId;
     if (dto.propId !== undefined) data.propId = dto.propId;
+    if (dto.propIds !== undefined) data.propIds = this.idsToJson(dto.propIds);
     if (dto.dialogue !== undefined) data.dialogue = dto.dialogue;
     if (dto.narration !== undefined) data.narration = dto.narration;
     if (dto.sceneDescription !== undefined)
@@ -348,7 +403,12 @@ export class ScriptService {
     if (dto.imagePrompt !== undefined) data.imagePrompt = dto.imagePrompt;
     if (dto.videoPrompt !== undefined) data.videoPrompt = dto.videoPrompt;
     if (dto.status !== undefined) data.status = dto.status;
-    return this.prisma.storyboard.update({ where: { id }, data });
+    const updated = await this.prisma.storyboard.update({ where: { id }, data });
+    return {
+      ...updated,
+      characterIds: this.jsonToIds(updated.characterIds),
+      propIds: this.jsonToIds(updated.propIds),
+    };
   }
 
   // 重排分镜：ids 顺序即最终顺序，依次重写 number

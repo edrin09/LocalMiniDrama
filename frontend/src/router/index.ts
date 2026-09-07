@@ -10,6 +10,12 @@ const router = createRouter({
       meta: { title: '我的短剧项目' },
     },
     {
+      path: '/assets',
+      name: 'assets',
+      component: () => import('@/views/Assets.vue'),
+      meta: { title: '资产中心' },
+    },
+    {
       path: '/project/:id',
       name: 'project-detail',
       component: () => import('@/views/ProjectDetail.vue'),
@@ -20,6 +26,12 @@ const router = createRouter({
       name: 'episode-edit',
       component: () => import('@/views/EpisodeEdit.vue'),
       meta: { title: '剧本编辑' },
+    },
+    {
+      path: '/project/:id/produce',
+      name: 'project-produce',
+      component: () => import('@/views/ProduceView.vue'),
+      meta: { title: '整剧一键成片' },
     },
   ],
 });

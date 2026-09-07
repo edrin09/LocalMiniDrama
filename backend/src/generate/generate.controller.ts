@@ -26,7 +26,19 @@ export class GenerateController {
     return this.logBus.subscribe(id) as unknown as Observable<MessageEvent>;
   }
 
-  // 整集一键生成：①角色 → ②场景 → ③道具 → ④分镜首尾帧（可勾选 ⑤视频/⑥配音/⑦合成）
+  // 整剧级生成日志 SSE 流：按剧订阅（配合 generate-all / 整剧成片进度页）
+  @Sse('dramas/:id/logs/stream')
+  streamDrama(@Param('id', ParseIntPipe) id: number): Observable<MessageEvent> {
+    return this.logBus.subscribeDrama(id) as unknown as Observable<MessageEvent>;
+  }
+
+  // 整剧一键成片：排队跑所有分集的完整流水线（拆解→素材→分镜→视频→配音→合成）
+  @Post('dramas/:id/generate-all')
+  generateAll(@Param('id', ParseIntPipe) id: number) {
+    return this.generate.generateDrama(id);
+  }
+
+  // 整集一键生成：①角色 → ②场景 → ③道具 → ④分镜首尾帧（可勾选 ⑤视频/⑥合成）
   @Post('episodes/:id/generate')
   generateEpisode(
     @Param('id', ParseIntPipe) id: number,
@@ -35,7 +47,7 @@ export class GenerateController {
     return this.generate.generateEpisode(id, { steps: body?.steps });
   }
 
-  // 一键重新生成分镜素材：按当前剧本强制重做全部首尾帧 → 视频 → 配音
+  // 一键重新生成分镜素材：按当前剧本强制重做全部首尾帧 → 视频
   @Post('episodes/:id/regenerate-storyboards')
   regenerateStoryboards(@Param('id', ParseIntPipe) id: number) {
     return this.generate.regenerateStoryboards(id);
@@ -120,15 +132,6 @@ export class GenerateController {
     @Body() body: { force?: boolean },
   ) {
     return this.generate.generateStoryboardVideo(id, body ?? {});
-  }
-
-  // 分镜配音（TTS：对白/旁白 → 音轨 audioUrl）
-  @Post('storyboards/:id/generate-audio')
-  generateStoryboardAudio(
-    @Param('id', ParseIntPipe) id: number,
-    @Body() body: { force?: boolean },
-  ) {
-    return this.generate.generateStoryboardAudio(id, body ?? {});
   }
 
   // 单分镜完整生成（参考图 + 视频）

@@ -149,10 +149,11 @@ export class AgnesProvider implements AIProvider {
     };
 
     const extraBody: Record<string, any> = { response_format: 'url' };
-    // 图生图 / 多图合成：必须放在 extra_body.image（支持 URL 与 Data URI）
+    // 图生图 / 多图合成：必须放在 extra_body.image（支持 URL 与 Data URI）。
+    // 输出必须保持 url（不能用 b64_json）：远端 URL 是视频接口 keyframe 首尾帧
+    // 控制的唯一可用媒体地址，改 b64 会导致视频全部退化为纯文生视频。
     if (Array.isArray(images) && images.length > 0) {
       extraBody.image = images;
-      extraBody.response_format = 'b64_json';
     }
 
     const data = await this.request(

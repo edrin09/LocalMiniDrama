@@ -1,7 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
-import { execFileSync } from 'child_process';
 
 export interface StoredAsset {
   /** 前端可直接访问的本地路径，如 /uploads/12/7/char-3.png */
@@ -143,12 +142,13 @@ export class StorageService {
 
   /**
    * 物理删除目录（递归）。
-   * 注意：直接调用 fs.promises.rm 会被运行时的 safe-delete 守卫拦截（>50 文件需确认），
-   * 因此改用平台命令（Windows rmdir /s /q，其余 rm -rf）绕过守卫，确保「重置」可物理删除。
+   * 必须用 Node 自带 fs.rmSync：直接 spawn `rmdir` 在 Windows 上必然 ENOENT
+   * （rmdir 是 cmd 内部命令而非可执行文件），且曾被 catch 静默吞掉，
+   * 导致「重置」从未真正删除过任何文件。
    */
   private purgeDir(dir: string): void {
     // 安全护栏：只允许删除 uploads 内部目录，且禁止删除 uploads 根目录本身，
-    // 防止 rm -rf 误删项目其他文件。
+    // 防止误删项目其他文件。
     const absRoot = path.resolve(this.root);
     const absDir = path.resolve(dir);
     if (absDir === absRoot || !absDir.startsWith(absRoot + path.sep)) {
@@ -156,13 +156,22 @@ export class StorageService {
       return;
     }
     try {
-      if (process.platform === 'win32') {
-        execFileSync('rmdir', [dir, '/s', '/q'], { stdio: 'ignore', windowsHide: true });
-      } else {
-        execFileSync('rm', ['-rf', dir], { stdio: 'ignore', windowsHide: true });
+      fs.rmSync(absDir, { recursive: true, force: true });
+    } catch (e: any) {
+      this.logger.warn(`目录删除失败：${dir}（${e?.message ?? e}）`);
+    }
+  }
+
+  /** 物理删除已不被记录引用的本地素材文件（远端 URL / 不存在则跳过，失败不抛出） */
+  async removeLocalFiles(urls: Array<string | null | undefined>): Promise<void> {
+    for (const u of urls) {
+      const abs = this.absFromUrl(u ?? null);
+      if (!abs) continue;
+      try {
+        await fs.promises.rm(abs, { force: true });
+      } catch {
+        /* 清理失败不阻塞生成主流程 */
       }
-    } catch {
-      // 目录可能已不存在，忽略
     }
   }
 

@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateEpisodeDto, UpdateEpisodeDto } from './dto/episode.dto';
 import * as fs from 'fs';
@@ -121,6 +121,142 @@ export class EpisodeService {
     if (dto.scriptText !== undefined) data.scriptText = dto.scriptText ?? null;
 
     return this.prisma.episode.update({ where: { id }, data });
+  }
+
+  /**
+   * 一键导入整本剧本：把整份 TXT 按「第N集」标题行拆分为多个分集，
+   * 每个分集 = 标题（含集号）+ 该集剧本原文（scriptText），一次性批量落库。
+   * 支持两种标题格式：
+   *   - `第1集 初见兵马俑` / `第1集：初见兵马俑`
+   *   - 或仅标题行（无「第N集」前缀时按顺序编号）
+   */
+  async importScript(
+    dramaId: number,
+    opts: { text?: string; mode?: 'append' | 'replace' } = {},
+  ) {
+    const drama = await this.prisma.drama.findFirst({
+      where: { id: dramaId, deletedAt: null },
+    });
+    if (!drama) throw new NotFoundException(`项目 ${dramaId} 不存在`);
+
+    const raw = (opts.text || '').replace(/\r\n/g, '\n').trim();
+    if (!raw) throw new BadRequestException('导入文本为空，请先粘贴或上传剧本');
+
+    // 按「第N集」标题行拆分
+    const blocks = this.splitScriptByEpisode(raw);
+    if (blocks.length === 0) {
+      throw new BadRequestException('未能识别出任何分集，请确认剧本包含「第N集」标题行');
+    }
+
+    const mode = opts.mode === 'replace' ? 'replace' : 'append';
+
+    // replace 模式：先软删除本项目已有分集（角色等共享资源不受影响，由调用方/重置流程处理）
+    if (mode === 'replace') {
+      const existing = await this.prisma.episode.findMany({
+        where: { dramaId, deletedAt: null },
+        select: { id: true },
+      });
+      for (const e of existing) {
+        await this.prisma.$transaction(async (tx) => {
+          await tx.storyboard.updateMany({
+            where: { episodeId: e.id },
+            data: { deletedAt: new Date(), status: 'cancelled' },
+          });
+          await tx.prop.updateMany({
+            where: { episodeId: e.id },
+            data: { deletedAt: new Date() },
+          });
+          await tx.scene.updateMany({
+            where: { episodeId: e.id },
+            data: { deletedAt: new Date() },
+          });
+          await tx.episode.update({
+            where: { id: e.id },
+            data: { deletedAt: new Date() },
+          });
+        });
+        this.cleanupMaterials(dramaId, e.id);
+      }
+    }
+
+    // 取当前最大集号作为起始，避免 append 时集号冲突
+    const max = await this.prisma.episode.aggregate({
+      where: { dramaId, deletedAt: null },
+      _max: { episodeNumber: true },
+    });
+    let nextNumber = (max._max.episodeNumber ?? 0) + 1;
+
+    const created: Array<{ id: number; episodeNumber: number; title: string }> = [];
+    for (const block of blocks) {
+      const episodeNumber = block.number ?? nextNumber;
+      nextNumber = Math.max(nextNumber, episodeNumber + 1);
+      const title = block.title || `第${episodeNumber}集：新分集`;
+      const ep = await this.prisma.episode.create({
+        data: {
+          dramaId,
+          title,
+          description: null,
+          episodeNumber,
+          status: 'draft',
+          merged: false,
+          scriptText: block.body,
+        },
+      });
+      await this.ensureUploadDir(dramaId, ep.id);
+      created.push({ id: ep.id, episodeNumber, title });
+    }
+
+    return { imported: created.length, episodes: created };
+  }
+
+  /**
+   * 把整本剧本文本按「第N集」标题行拆分为块。
+   * 标题行匹配：`第N集` 开头（N 为数字），可带冒号、空格、中文顿号等分隔，
+   * 后续为标题文字。正文为标题行之后、下一标题行之前的全部内容。
+   */
+  private splitScriptByEpisode(text: string): Array<{
+    number?: number;
+    title?: string;
+    body: string;
+  }> {
+    const lines = text.split('\n');
+    const blocks: Array<{ number?: number; title?: string; body: string }> = [];
+    let current: { number?: number; title?: string; body: string[] } | null = null;
+
+    const flush = () => {
+      if (current) {
+        const body = current.body.join('\n').trim();
+        if (body) {
+          blocks.push({
+            number: current.number,
+            title: current.title,
+            body,
+          });
+        }
+        current = null;
+      }
+    };
+
+    const EP_RE = /^第\s*(\d+)\s*集\s*[:：、.\s]*(.*)$/;
+
+    for (const line of lines) {
+      const m = line.trim().match(EP_RE);
+      if (m) {
+        flush();
+        const num = parseInt(m[1], 10);
+        const title = m[2]?.trim();
+        current = {
+          number: num,
+          title: title ? `第${num}集：${title}` : `第${num}集：新分集`,
+          body: [],
+        };
+      } else if (current) {
+        current.body.push(line);
+      }
+      // 标题行之前的内容（如剧名、前言）忽略
+    }
+    flush();
+    return blocks;
   }
 
   // 软删除该集的分镜/场景/道具/分集，终止进行中的生成任务；

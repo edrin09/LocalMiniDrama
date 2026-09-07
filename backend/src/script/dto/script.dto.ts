@@ -1,4 +1,5 @@
 import {
+  IsArray,
   IsBoolean,
   IsInt,
   IsNumber,
@@ -97,8 +98,10 @@ export class CreateStoryboardDto {
 
   @IsOptional() @IsInt() number?: number;
   @IsOptional() @IsInt() characterId?: number;
+  @IsOptional() @IsArray() characterIds?: number[];
   @IsOptional() @IsInt() sceneId?: number;
   @IsOptional() @IsInt() propId?: number;
+  @IsOptional() @IsArray() propIds?: number[];
   @IsOptional() @IsString() dialogue?: string;
   @IsOptional() @IsString() narration?: string;
   @IsOptional() @IsString() sceneDescription?: string;
@@ -116,8 +119,10 @@ export class CreateStoryboardDto {
 export class UpdateStoryboardDto {
   @IsOptional() @IsInt() number?: number;
   @IsOptional() @IsInt() characterId?: number;
+  @IsOptional() @IsArray() characterIds?: number[];
   @IsOptional() @IsInt() sceneId?: number;
   @IsOptional() @IsInt() propId?: number;
+  @IsOptional() @IsArray() propIds?: number[];
   @IsOptional() @IsString() dialogue?: string;
   @IsOptional() @IsString() narration?: string;
   @IsOptional() @IsString() sceneDescription?: string;

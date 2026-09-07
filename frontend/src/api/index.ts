@@ -28,6 +28,13 @@ export const episodeApi = {
   create: (data: Partial<Episode>) => http.post<Episode>('/episodes', data).then((r) => r.data),
   update: (id: number, data: Partial<Episode>) => http.put<Episode>(`/episodes/${id}`, data).then((r) => r.data),
   remove: (id: number) => http.delete(`/episodes/${id}`).then((r) => r.data),
+  importScript: (dramaId: number, text: string, mode: 'append' | 'replace' = 'append') =>
+    http
+      .post<{ imported: number; episodes: Array<{ id: number; episodeNumber: number; title: string }> }>(
+        '/episodes/import-script',
+        { dramaId, text, mode },
+      )
+      .then((r) => r.data),
 };
 
 // ===== 配置 =====
@@ -83,6 +90,9 @@ export const uploadApi = {
 
 export const generateApi = {
   logsUrl: (episodeId: number) => `/api/episodes/${episodeId}/logs/stream`,
+  dramaLogsUrl: (dramaId: number) => `/api/dramas/${dramaId}/logs/stream`,
+  generateDrama: (dramaId: number) =>
+    http.post(`/dramas/${dramaId}/generate-all`).then((r) => r.data),
   generateEpisode: (episodeId: number, steps?: Record<string, boolean>) =>
     http.post(`/episodes/${episodeId}/generate`, steps ? { steps } : {}).then((r) => r.data),
   regenerateStoryboards: (episodeId: number) =>
@@ -99,8 +109,6 @@ export const generateApi = {
     http.post(`/storyboards/${id}/generate-image`, { force }).then((r) => r.data),
   generateStoryboardVideo: (id: number, force = false) =>
     http.post(`/storyboards/${id}/generate-video`, { force }).then((r) => r.data),
-  generateStoryboardAudio: (id: number, force = false) =>
-    http.post(`/storyboards/${id}/generate-audio`, { force }).then((r) => r.data),
   merge: (episodeId: number, cfg: Partial<MergeConfig>) =>
     http.post(`/episodes/${episodeId}/merge`, cfg).then((r) => r.data),
   resetEpisode: (episodeId: number) =>

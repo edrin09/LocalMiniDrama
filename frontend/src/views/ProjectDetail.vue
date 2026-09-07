@@ -2,7 +2,7 @@
 import { onMounted, reactive, ref, computed } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { ArrowLeft, Plus, Edit, Delete, VideoPlay, MagicStick, Refresh } from '@element-plus/icons-vue';
+import { ArrowLeft, Plus, Edit, Delete, VideoPlay, MagicStick, Refresh, Upload } from '@element-plus/icons-vue';
 import { dramaApi, episodeApi, generateApi } from '@/api';
 import { DIALECT_MAP, COVER_STYLES } from '@/utils/dialect';
 import type { Drama, Episode } from '@/types';
@@ -140,6 +140,11 @@ function goBack() {
   router.push('/');
 }
 
+// ===== 整剧一键成片：进入整剧流水线进度页 =====
+function openProduce() {
+  router.push(`/project/${dramaId}/produce`);
+}
+
 // ===== 重置分集（清空重来：删光本集数据 + 自动按剧本重建）=====
 async function resetEpisode(e: Episode) {
   try {
@@ -221,6 +226,53 @@ function formatDuration(s?: number | null) {
   return `${s} 秒`;
 }
 
+// ===== 一键导入整本剧本 =====
+const importModal = reactive({ show: false });
+const importState = reactive({
+  text: '',
+  mode: 'append' as 'append' | 'replace',
+  busy: false,
+});
+const importing = ref(false);
+
+function openImport() {
+  importState.text = '';
+  importState.mode = 'append';
+  importModal.show = true;
+}
+
+function onImportFile(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    importState.text = String(reader.result || '');
+  };
+  reader.readAsText(file, 'utf-8');
+  input.value = '';
+}
+
+async function confirmImport() {
+  const text = importState.text.trim();
+  if (!text) {
+    ElMessage.warning('请先粘贴剧本文本或上传 TXT 文件');
+    return;
+  }
+  if (importing.value) return;
+  importing.value = true;
+  try {
+    const res = await episodeApi.importScript(dramaId, text, importState.mode);
+    ElMessage.success(`成功导入 ${res.imported} 个分集`);
+    importModal.show = false;
+    await loadAll();
+  } catch (e: any) {
+    ElMessage.error(e.message);
+  } finally {
+    importing.value = false;
+  }
+}
+
 function coverGradient(i: number) {
   const list = ['#8b5cf6', '#6366f1', '#10b981', '#ec4899', '#f59e0b'];
   const c = list[i % list.length];
@@ -248,11 +300,17 @@ onMounted(loadAll);
           <button class="lmd-btn-ghost" @click="openProjectSettings">
             <el-icon class="mr-1"><Edit /></el-icon>项目设置
           </button>
+          <button class="lmd-btn-ghost" @click="openProduce" title="排队跑完所有分集成片流水线，带整剧进度">
+            <el-icon class="mr-1"><VideoPlay /></el-icon>整剧一键成片
+          </button>
           <button class="lmd-btn-ghost" @click="resetDrama">
             <el-icon class="mr-1"><Refresh /></el-icon>重置项目
           </button>
           <button class="lmd-btn-ghost" :disabled="batchParsing" @click="batchParseScripts" title="对每个已保存剧本的分集，按剧本原文重建角色/场景/道具/分镜">
             <el-icon class="mr-1"><MagicStick /></el-icon>{{ batchParsing ? '拆解发起中...' : '批量拆解' }}
+          </button>
+          <button class="lmd-btn-ghost" @click="openImport" title="一次性导入整本 TXT 剧本，自动按「第N集」拆分成分集">
+            <el-icon class="mr-1"><Upload /></el-icon>一键导入
           </button>
           <button class="lmd-btn-primary flex items-center gap-1" :disabled="creating" @click="addEpisode">
             <el-icon :size="16"><Plus /></el-icon>{{ creating ? '创建中...' : '添加分集' }}
@@ -302,8 +360,11 @@ onMounted(loadAll);
       <div v-else-if="episodes.length === 0" class="lmd-empty">
         <div class="lmd-empty-icon">🎬</div>
         <h3>还没有分集</h3>
-        <p>添加你的第一个分集，开始剧本创作</p>
-        <button class="lmd-btn-primary mt-4" @click="addEpisode">＋ 添加第一个分集</button>
+        <p>添加你的第一个分集，或一键导入整本 TXT 剧本</p>
+        <div class="flex items-center justify-center gap-3 mt-4">
+          <button class="lmd-btn-primary" @click="addEpisode">＋ 添加第一个分集</button>
+          <button class="lmd-btn-ghost" @click="openImport">一键导入 TXT</button>
+        </div>
       </div>
 
       <!-- 分集网格 -->
@@ -382,6 +443,51 @@ onMounted(loadAll);
           <button class="lmd-btn-ghost" @click="showProjectModal = false">取消</button>
           <button class="lmd-btn-primary" :disabled="savingProject" @click="saveProject">
             {{ savingProject ? '保存中...' : '保存' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 一键导入整本剧本弹窗 ===== -->
+    <div v-if="importModal.show" class="lmd-mask" @click.self="importModal.show = false">
+      <div class="lmd-modal" style="max-width: 680px">
+        <h3 class="lmd-modal-title">一键导入整本剧本</h3>
+        <p class="text-sm mt-2" style="color: var(--muted)">
+          粘贴整本 TXT 剧本（或上传 .txt 文件），系统会按「第N集」标题行自动拆分成多个分集，并自动填入每集剧本原文。
+        </p>
+        <div class="space-y-4 mt-4">
+          <div class="flex items-center gap-3">
+            <label class="lmd-btn-ghost" style="cursor: pointer; display: inline-flex; align-items: center; gap: 6px">
+              <el-icon :size="14"><Upload /></el-icon>上传 TXT 文件
+              <input type="file" accept=".txt,text/plain" style="display: none" @change="onImportFile" />
+            </label>
+            <span class="text-xs" style="color: var(--muted)">支持 .txt，编码建议 UTF-8</span>
+          </div>
+          <div>
+            <label class="lmd-label">剧本内容（每集以「第N集 标题」开头）</label>
+            <textarea
+              v-model="importState.text"
+              rows="12"
+              class="lmd-input"
+              placeholder="第1集 初见兵马俑&#10;【镜头】兵马俑一号坑&#10;蛋蛋：哇！……&#10;&#10;第2集 和跪射俑灵魂对话&#10;【镜头】跪射俑玻璃展柜&#10;……"
+            ></textarea>
+          </div>
+          <div>
+            <label class="lmd-label">导入方式</label>
+            <div class="flex items-center gap-4">
+              <label class="flex items-center gap-2 text-sm" style="color: var(--text-2); cursor: pointer">
+                <input type="radio" value="append" v-model="importState.mode" /> 追加（保留已有分集）
+              </label>
+              <label class="flex items-center gap-2 text-sm" style="color: var(--text-2); cursor: pointer">
+                <input type="radio" value="replace" v-model="importState.mode" /> 覆盖（清空已有分集后重建）
+              </label>
+            </div>
+          </div>
+        </div>
+        <div class="flex justify-end gap-3 mt-6">
+          <button class="lmd-btn-ghost" @click="importModal.show = false">取消</button>
+          <button class="lmd-btn-primary" :disabled="importing" @click="confirmImport">
+            {{ importing ? '导入中...' : '开始导入' }}
           </button>
         </div>
       </div>
