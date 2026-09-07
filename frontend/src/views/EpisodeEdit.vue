@@ -1749,21 +1749,27 @@ onBeforeUnmount(() => {
               @dragend="onSbDragEnd(i)"
               @dragleave="dragOverIdx = -1"
             >
-              <div class="sb-thumb">
-                <el-image v-if="sbThumb(sb)" :src="sbThumb(sb)" :alt="`分镜 #${sb.number}`" class="sb-thumb-img" :preview-src-list="[sbThumb(sb)]" preview-teleported fit="cover" />
-                <div v-else class="sb-thumb-null">未生成素材</div>
-                <button class="sb-grip" title="按住拖动排序" @click.stop>⠿</button>
-                <button class="icon-btn danger sb-del" title="删除分镜" @click.stop="removeStoryboard(sb)">
-                  <el-icon :size="14"><Delete /></el-icon>
-                </button>
-                <div class="sb-thumb-bar">
+              <button class="sb-grip" title="按住拖动排序" @click.stop>⠿</button>
+              <div class="sb-item-thumb">
+                <el-image v-if="sbThumb(sb)" :src="sbThumb(sb)" :alt="`分镜 #${sb.number}`" class="sb-item-thumb-img" :preview-src-list="[sbThumb(sb)]" preview-teleported fit="cover" />
+                <div v-else class="sb-thumb-null">无</div>
+              </div>
+              <div class="sb-item-info">
+                <div class="sb-item-head">
                   <span class="sb-num">#{{ sb.number }}</span>
                   <span class="sb-dur">{{ sb.duration }}s</span>
-                  <span class="sb-bar-spacer"></span>
                   <span v-if="sbHasVideo(sb)" class="sb-bar-video"><el-icon :size="11"><VideoPlay /></el-icon></span>
                   <span class="badge" :class="statusMeta(sb.status).cls">{{ statusMeta(sb.status).text }}</span>
                 </div>
+                <div class="sb-item-desc">
+                  <span v-if="sb.dialogue" class="sb-item-dialogue">{{ sb.dialogue }}</span>
+                  <span v-else-if="sb.sceneDescription" class="sb-item-scene">{{ sb.sceneDescription }}</span>
+                  <span v-else class="sb-item-empty">未填写文案</span>
+                </div>
               </div>
+              <button class="icon-btn danger sb-del" title="删除分镜" @click.stop="removeStoryboard(sb)">
+                <el-icon :size="14"><Delete /></el-icon>
+              </button>
             </div>
             <div v-if="storyboards.length === 0" class="empty-tip">暂无分镜，点击右上角「添加分镜」</div>
           </div>
@@ -1807,12 +1813,12 @@ onBeforeUnmount(() => {
               <div class="preview-row">
                 <div class="preview-box">
                   <div class="preview-cap">首帧</div>
-                  <el-image v-if="selectedStoryboard.imageUrl" :src="selectedStoryboard.imageUrl" class="preview-img" :preview-src-list="[selectedStoryboard.imageUrl]" preview-teleported fit="cover" />
+                  <el-image v-if="selectedStoryboard.imageUrl" :src="selectedStoryboard.imageUrl" class="preview-img" :preview-src-list="[selectedStoryboard.imageUrl]" preview-teleported fit="contain" />
                   <div v-else class="preview-empty">未生成</div>
                 </div>
                 <div class="preview-box">
                   <div class="preview-cap">尾帧</div>
-                  <el-image v-if="selectedStoryboard.lastFrameUrl" :src="selectedStoryboard.lastFrameUrl" class="preview-img" :preview-src-list="[selectedStoryboard.lastFrameUrl]" preview-teleported fit="cover" />
+                  <el-image v-if="selectedStoryboard.lastFrameUrl" :src="selectedStoryboard.lastFrameUrl" class="preview-img" :preview-src-list="[selectedStoryboard.lastFrameUrl]" preview-teleported fit="contain" />
                   <div v-else class="preview-empty">未生成</div>
                 </div>
                 <div class="preview-box">
@@ -2732,43 +2738,46 @@ onBeforeUnmount(() => {
 
 /* 分镜布局 */
 .sb-layout { display: grid; grid-template-columns: minmax(380px, 460px) minmax(0, 1fr); gap: 16px; align-items: start; }
-.sb-list { background: var(--card); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; position: sticky; top: 132px; display: flex; flex-direction: column; }
+.sb-list { background: var(--card); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; position: sticky; top: 132px; display: flex; flex-direction: column; max-height: calc(100vh - 148px); }
 .sb-list-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--border); }
-.sb-list-body { padding: 10px; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; align-content: start; }
-.sb-item { position: relative; padding: 6px; border: 1px solid var(--border); border-radius: 12px; cursor: pointer; transition: all .2s; background: #fff; }
+.sb-list-body { padding: 8px; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; flex: 1; }
+.sb-item { position: relative; display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; transition: all .2s; background: #fff; min-height: 52px; }
 .sb-item:hover { border-color: #c7d2fe; }
 .sb-item.active { background: var(--screen-soft); border-color: var(--indigo); }
 .sb-item[draggable="true"] { cursor: grab; }
 .sb-item[draggable="true"]:active { cursor: grabbing; }
 .sb-item.dragging { opacity: 0.55; border-style: dashed; }
 .sb-item.drag-over { border-color: var(--indigo); box-shadow: 0 0 0 2px var(--indigo-soft); transform: translateY(2px); }
-/* 分镜缩略图（时间线画布） */
-.sb-thumb { position: relative; aspect-ratio: 16 / 10; border-radius: 8px; overflow: hidden; background: #eef2f7; display: flex; align-items: center; justify-content: center; }
-.sb-thumb img, :deep(.sb-thumb-img.el-image) { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
-:deep(.sb-thumb-img.el-image img) { width: 100%; height: 100%; object-fit: cover; cursor: zoom-in; }
-.sb-thumb-null { color: var(--muted); font-size: 12px; }
-.sb-thumb-bar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: linear-gradient(to top, rgba(15,23,42,0.78), rgba(15,23,42,0)); }
-.sb-thumb-bar .sb-num { color: #fff; }
-.sb-thumb-bar .sb-dur { color: #cbd5e1; }
-.sb-bar-spacer { flex: 1; }
-.sb-bar-video { display: inline-flex; color: #fff; }
-.sb-grip { position: absolute; left: 6px; top: 6px; width: 26px; height: 26px; border: none; background: rgba(255,255,255,0.85); border-radius: 6px; color: var(--text-2); cursor: grab; display: flex; align-items: center; justify-content: center; font-size: 16px; line-height: 1; opacity: 0; transition: opacity .2s; }
+/* 分镜列表缩略图 */
+.sb-item-thumb { width: 48px; height: 36px; border-radius: 6px; overflow: hidden; background: #eef2f7; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.sb-item-thumb-img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
+.sb-item-thumb-img img { width: 100%; height: 100%; object-fit: cover; }
+.sb-thumb-null { color: var(--muted); font-size: 10px; }
+/* 分镜列表详情 */
+.sb-item-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sb-item-head { display: flex; align-items: center; gap: 6px; }
+.sb-item-desc { font-size: 12px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.4; }
+.sb-item-dialogue { color: var(--text); }
+.sb-item-scene { color: var(--muted); font-style: italic; }
+.sb-item-empty { color: var(--muted); }
+.sb-bar-video { display: inline-flex; color: var(--indigo); }
+.sb-grip { width: 20px; height: 20px; border: none; background: transparent; border-radius: 4px; color: var(--muted); cursor: grab; display: flex; align-items: center; justify-content: center; font-size: 14px; line-height: 1; opacity: 0; transition: opacity .2s; flex-shrink: 0; }
 .sb-item:hover .sb-grip { opacity: 1; }
 .sb-grip:active { cursor: grabbing; }
-.sb-num { font-weight: 700; color: var(--indigo); font-size: 13px; }
-.sb-dur { font-size: 11px; color: var(--muted); }
-.badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; }
+.sb-num { font-weight: 700; color: var(--indigo); font-size: 12px; white-space: nowrap; }
+.sb-dur { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; white-space: nowrap; }
 .lmd-badge-emerald { background: var(--emerald-soft); color: #059669; }
 .lmd-badge-indigo { background: var(--screen-soft); color: var(--indigo); }
 .lmd-badge-gray { background: #f1f5f9; color: var(--muted); }
 .dialect-chip { background: #eef2ff; color: #4f46e5; border-radius: 6px; padding: 1px 6px; font-size: 11px; }
 .dialect-chip.strong { color: #6d28d9; font-weight: 600; }
-.sb-del { position: absolute; top: 8px; right: 8px; opacity: 0; transition: opacity .2s; }
+.sb-del { opacity: 0; transition: opacity .2s; flex-shrink: 0; }
 .sb-item:hover .sb-del { opacity: 1; }
 
 /* 分镜编辑 */
-.sb-edit { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; display: flex; flex-direction: column; gap: 12px; position: sticky; top: 132px; max-height: calc(100vh - 148px); overflow-y: auto; }
-.sb-edit-dock { position: sticky; top: 0; z-index: 6; background: var(--card); padding-bottom: 6px; }
+.sb-edit { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+.sb-edit-dock { position: static; z-index: 6; background: var(--card); padding-bottom: 6px; }
 .sb-edit-head { margin-bottom: 0; }
 .edit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .edit-grid > .el-textarea, .assoc-label, .gen-row { grid-column: 1 / -1; }
@@ -2832,12 +2841,13 @@ onBeforeUnmount(() => {
 
 /* 画面预览 */
 .preview-row { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-.preview-box { border: 1px solid var(--border); border-radius: 12px; padding: 8px; text-align: center; }
+.preview-box { border: 1px solid var(--border); border-radius: 12px; padding: 8px; text-align: center; display: flex; flex-direction: column; }
 .preview-cap { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
-.preview-img { width: 100%; max-height: 260px; border-radius: 8px; object-fit: cover; background: #0f172a; display: block; cursor: zoom-in; }
-.preview-video { width: 100%; max-height: 260px; border-radius: 8px; background: #000; object-fit: contain; }
-:deep(.preview-img.el-image) { width: 100%; max-height: 260px; border-radius: 8px; }
-.preview-empty { height: 96px; display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--muted); background: #f8fafc; border-radius: 8px; }
+.preview-img { width: 100%; height: auto; min-height: 140px; max-height: min(560px, 66vh); border-radius: 8px; object-fit: contain; background: #0f172a; display: block; cursor: zoom-in; }
+.preview-video { width: 100%; height: auto; max-height: min(560px, 66vh); border-radius: 8px; background: #000; object-fit: contain; display: block; aspect-ratio: auto 9 / 16; }
+:deep(.preview-img.el-image) { width: 100%; height: auto; min-height: 140px; max-height: min(560px, 66vh); border-radius: 8px; overflow: hidden; }
+:deep(.preview-img.el-image) .el-image__inner { width: 100%; height: auto; max-height: min(560px, 66vh); object-fit: contain; object-position: center center; }
+.preview-empty { flex: 1; min-height: 200px; display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--muted); background: #f8fafc; border-radius: 8px; }
 
 /* 画面提示词 */
 .prompt-grid { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
