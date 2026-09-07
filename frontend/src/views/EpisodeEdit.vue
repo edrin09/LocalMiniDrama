@@ -15,6 +15,11 @@ import {
   RefreshRight,
   Refresh,
   Upload,
+  User,
+  Location,
+  Goods,
+  Film,
+  ArrowDown,
 } from '@element-plus/icons-vue';
 import {
   episodeApi,
@@ -67,6 +72,7 @@ const scriptTab = ref<StepKey>('storyboards');
 const logs = ref<{ level: string; text: string; at: number; id: number }[]>([]);
 const logSeq = ref(0);
 const terminalEl = ref<HTMLElement | null>(null);
+const logOpen = ref(true);
 const generating = ref(false);
 const mergeRunning = ref(false);
 const mergeProgress = ref(0);
@@ -500,6 +506,31 @@ const sbForm = reactive({
 });
 
 /** 表单回填期间挂起自动保存，避免切换分镜触发误保存 */
+/* 分镜编辑区：可折叠区块（默认全展开，供快速编辑） */
+const sbSections = reactive({
+  preview: true,
+  basic: true,
+  copy: true,
+  prompt: true,
+});
+
+/** 关联与基本设置区块的折叠摘要 */
+function sbSectionSummary(): string {
+  const parts: string[] = [];
+  const roleNames = sbCharacterNames(selectedStoryboard.value as Storyboard);
+  if (selectedStoryboard.value && charsOf(selectedStoryboard.value).length) parts.push(`角色 ${roleNames}`);
+  if (sceneOf(selectedStoryboard.value as Storyboard)) parts.push(`场景 ${sceneOf(selectedStoryboard.value as Storyboard)!.location}`);
+  if (propsOf(selectedStoryboard.value as Storyboard).length) parts.push(`道具 ${propsOf(selectedStoryboard.value as Storyboard).length} 个`);
+  if (!parts.length) return '未配置关联';
+  return parts.join(' · ');
+}
+
+/** 锚点导航：滚动到对应区块 */
+function scrollToSection(key: string) {
+  const el = document.querySelector(`[data-sb="${key}"]`);
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
 let sbHydrating = false;
 let sbSaveTimer: ReturnType<typeof setTimeout> | null = null;
 const autoSavedAt = ref<string | null>(null);
@@ -663,7 +694,7 @@ async function removeStoryboard(sb: Storyboard) {
 /* ================= 分镜时间线：拖动排序 ================= */
 const dragIdx = ref(-1); // 当前被拖动的分镜下标
 const dragOverIdx = ref(-1); // 拖拽悬停目标下标
-const hoverSb = ref(-1); // 鼠标悬停的分镜下标（用于显示视频播放预览）
+
 
 function onSbDragStart(i: number) {
   if (generating.value || regenSbRunning.value) return;
@@ -1387,6 +1418,21 @@ const countFor = (k: StepKey) => {
   return 0;
 };
 
+/* ================= 详细流水线进度（每个角色/场景/道具/分镜的完成状态） ================= */
+const detailDone = computed(() => ({
+  characters: characters.value.filter((c) => !!c.imageUrl).length,
+  scenes: scenes.value.filter((s) => !!s.imageUrl).length,
+  props: props.value.filter((p) => !!p.imageUrl).length,
+  sbImages: storyboards.value.filter((s) => !!s.imageUrl || !!s.lastFrameUrl).length,
+  sbVideos: storyboards.value.filter((s) => !!s.videoUrl).length,
+}));
+const detailTotal = computed(() => ({
+  characters: characters.value.length,
+  scenes: scenes.value.length,
+  props: props.value.length,
+  storyboards: storyboards.value.length,
+}));
+
 onMounted(() => {
   connectLogStream();
   flowStep.value = route.query.generate === '1' ? 'characters' : '';
@@ -1436,7 +1482,7 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <!-- 成片进度流程图：实时高亮当前流水线步骤（SSE phase 事件驱动） -->
+    <!-- 成片进度流程图：实时高亮当前流水线步骤（SSE phase 事件驱动）+ 各资源详细进度 -->
     <section v-show="generating || flowStep" class="pipeline-box">
       <div class="pipeline-inner">
         <div class="pipeline-title">
@@ -1463,6 +1509,62 @@ onBeforeUnmount(() => {
           <span v-if="flowLabel">{{ flowLabel }}进行中...</span>
           <span v-else-if="generating">流水线启动中...</span>
           <span v-else>等待生成</span>
+        </div>
+
+        <!-- 详细资源进度：每个角色/场景/道具/分镜的完成状态 -->
+        <div class="pipeline-detail">
+          <div class="pdetail-block" v-if="detailTotal.characters">
+            <span class="pdetail-cap"><el-icon :size="12"><User /></el-icon>角色</span>
+            <div class="pdetail-pills">
+              <span
+                v-for="c in characters"
+                :key="c.id"
+                class="pdetail-pill"
+                :class="{ done: !!c.imageUrl, busy: assetBusy[keyOf('characters', c.id)] }"
+                :title="`${c.name}${c.imageUrl ? '：形象已生成' : '：形象待生成'}`"
+              >{{ c.name }}<template v-if="c.imageUrl">✓</template></span>
+            </div>
+          </div>
+          <div class="pdetail-block" v-if="detailTotal.scenes">
+            <span class="pdetail-cap"><el-icon :size="12"><Location /></el-icon>场景</span>
+            <div class="pdetail-pills">
+              <span
+                v-for="s in scenes"
+                :key="s.id"
+                class="pdetail-pill"
+                :class="{ done: !!s.imageUrl, busy: assetBusy[keyOf('scenes', s.id)] }"
+                :title="`${s.location}${s.imageUrl ? '：场景图已生成' : '：场景图待生成'}`"
+              >{{ s.location }}<template v-if="s.imageUrl">✓</template></span>
+            </div>
+          </div>
+          <div class="pdetail-block" v-if="detailTotal.props">
+            <span class="pdetail-cap"><el-icon :size="12"><Goods /></el-icon>道具</span>
+            <div class="pdetail-pills">
+              <span
+                v-for="p in props"
+                :key="p.id"
+                class="pdetail-pill"
+                :class="{ done: !!p.imageUrl, busy: assetBusy[keyOf('props', p.id)] }"
+                :title="`${p.name}${p.imageUrl ? '：道具图已生成' : '：道具图待生成'}`"
+              >{{ p.name }}<template v-if="p.imageUrl">✓</template></span>
+            </div>
+          </div>
+          <div class="pdetail-block">
+            <span class="pdetail-cap"><el-icon :size="12"><Film /></el-icon>分镜</span>
+            <div class="pdetail-pills">
+              <span
+                v-for="(sb, si) in storyboards"
+                :key="sb.id"
+                class="pdetail-pill"
+                :class="{
+                  done: !!sb.videoUrl,
+                  half: !!sb.imageUrl && !sb.videoUrl,
+                  busy: selectedSbIndex === si && assetBusy['sb-image'] || assetBusy['sb-video'],
+                }"
+                :title="`分镜#${sb.number}：${sb.videoUrl ? '视频已生成' : sb.imageUrl ? '图片已生成，视频待生成' : '素材待生成'}`"
+              >#{{ sb.number }}<template v-if="sb.videoUrl">✓</template><template v-else-if="sb.imageUrl">◐</template></span>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -1519,16 +1621,18 @@ onBeforeUnmount(() => {
         </div>
         <div class="lmd-card res-grid">
           <div v-for="c in characters" :key="c.id" class="res-card">
-            <div class="res-avatar">
-              <img v-if="c.imageUrl" :src="c.imageUrl" :alt="c.name" class="res-thumb" />
-              <span v-else>{{ c.role === 'main' ? '⭐' : '🧑' }}</span>
-            </div>
-            <div class="res-body">
-              <div class="res-name">{{ c.name }} <el-tag size="small" effect="plain">{{ c.roleLabel || (c.role === 'main' ? '主角' : '配角') }}</el-tag></div>
-              <div class="res-meta">方言：{{ c.dialect ? DIALECT_MAP[c.dialect]?.label : '跟随剧集/分镜' }}</div>
-              <div class="res-meta">关联分镜：{{ usedBy('characters', c.id) }} · {{ c.appearance ? c.appearance.slice(0, 40) : '暂无外貌描述' }}</div>
-              <div class="res-meta" v-if="c.anchors"><span class="anchor-tag">✅ 视觉锚点已生成</span></div>
-              <div class="res-meta" v-if="c.referenceImageUrl"><span class="anchor-tag" style="color:#6366f1">📷 参考图已上传</span></div>
+            <div class="res-top">
+              <div class="res-avatar">
+                <el-image v-if="c.imageUrl" :src="c.imageUrl" :alt="c.name" class="res-thumb" :preview-src-list="[c.imageUrl]" preview-teleported fit="cover" />
+                <span v-else>{{ c.role === 'main' ? '⭐' : '🧑' }}</span>
+              </div>
+              <div class="res-body">
+                <div class="res-name">{{ c.name }} <el-tag size="small" effect="plain">{{ c.roleLabel || (c.role === 'main' ? '主角' : '配角') }}</el-tag></div>
+                <div class="res-meta">方言：{{ c.dialect ? DIALECT_MAP[c.dialect]?.label : '跟随剧集/分镜' }}</div>
+                <div class="res-meta">关联分镜：{{ usedBy('characters', c.id) }} · {{ c.appearance ? c.appearance.slice(0, 40) : '暂无外貌描述' }}</div>
+                <div class="res-meta" v-if="c.anchors"><span class="anchor-tag">✅ 视觉锚点已生成</span></div>
+                <div class="res-meta" v-if="c.referenceImageUrl"><span class="anchor-tag" style="color:#6366f1">📷 参考图已上传</span></div>
+              </div>
             </div>
             <div class="res-actions">
               <button class="icon-btn" :class="{ busy: assetBusy[keyOf('characters', c.id)] }" :title="c.imageUrl ? '重新生成形象' : 'AI 生成形象'" @click="genCharacter(c)">
@@ -1553,17 +1657,19 @@ onBeforeUnmount(() => {
         </div>
         <div class="lmd-card res-grid">
           <div v-for="s in scenes" :key="s.id" class="res-card">
-            <div class="res-avatar">
-              <img v-if="s.imageUrl" :src="s.imageUrl" :alt="s.location" class="res-thumb" />
-              <span v-else>🏠</span>
-            </div>
-            <div class="res-body">
-              <div class="res-name">{{ s.location }} <el-tag v-if="s.time" size="small" effect="plain">{{ s.time }}</el-tag>
-                <el-tag v-if="s.useQuadGrid" size="small" type="warning" effect="plain">四宫格</el-tag>
+            <div class="res-top">
+              <div class="res-avatar">
+                <el-image v-if="s.imageUrl" :src="s.imageUrl" :alt="s.location" class="res-thumb" :preview-src-list="[s.imageUrl]" preview-teleported fit="cover" />
+                <span v-else>🏠</span>
               </div>
-              <div class="res-meta">关联分镜：{{ usedBy('scenes', s.id) }}</div>
-              <div class="res-meta">{{ s.description ? s.description.slice(0, 40) : '暂无场景描述' }}</div>
-              <div class="res-meta" v-if="s.referenceImageUrl"><span class="anchor-tag" style="color:#6366f1">📷 参考图已上传</span></div>
+              <div class="res-body">
+                <div class="res-name">{{ s.location }} <el-tag v-if="s.time" size="small" effect="plain">{{ s.time }}</el-tag>
+                  <el-tag v-if="s.useQuadGrid" size="small" type="warning" effect="plain">四宫格</el-tag>
+                </div>
+                <div class="res-meta">关联分镜：{{ usedBy('scenes', s.id) }}</div>
+                <div class="res-meta">{{ s.description ? s.description.slice(0, 40) : '暂无场景描述' }}</div>
+                <div class="res-meta" v-if="s.referenceImageUrl"><span class="anchor-tag" style="color:#6366f1">📷 参考图已上传</span></div>
+              </div>
             </div>
             <div class="res-actions">
               <button class="icon-btn" :class="{ busy: assetBusy[keyOf('scenes', s.id)] }" :title="s.imageUrl ? '重新生成场景图' : 'AI 生成场景图'" @click="genScene(s, true)">
@@ -1588,17 +1694,19 @@ onBeforeUnmount(() => {
         </div>
         <div class="lmd-card res-grid">
           <div v-for="p in props" :key="p.id" class="res-card">
-            <div class="res-avatar">
-              <img v-if="p.imageUrl" :src="p.imageUrl" :alt="p.name" class="res-thumb" />
-              <span v-else>🪑</span>
-            </div>
-            <div class="res-body">
-              <div class="res-name">{{ p.name }} <el-tag v-if="p.type" size="small" effect="plain">{{ p.type }}</el-tag>
-                <el-tag v-if="p.useQuadGrid" size="small" type="warning" effect="plain">四视图</el-tag>
+            <div class="res-top">
+              <div class="res-avatar">
+                <el-image v-if="p.imageUrl" :src="p.imageUrl" :alt="p.name" class="res-thumb" :preview-src-list="[p.imageUrl]" preview-teleported fit="cover" />
+                <span v-else>🪑</span>
               </div>
-              <div class="res-meta">关联分镜：{{ usedBy('props', p.id) }}</div>
-              <div class="res-meta">{{ p.description ? p.description.slice(0, 40) : '无描述' }}</div>
-              <div class="res-meta" v-if="p.referenceImageUrl"><span class="anchor-tag" style="color:#6366f1">📷 参考图已上传</span></div>
+              <div class="res-body">
+                <div class="res-name">{{ p.name }} <el-tag v-if="p.type" size="small" effect="plain">{{ p.type }}</el-tag>
+                  <el-tag v-if="p.useQuadGrid" size="small" type="warning" effect="plain">四视图</el-tag>
+                </div>
+                <div class="res-meta">关联分镜：{{ usedBy('props', p.id) }}</div>
+                <div class="res-meta">{{ p.description ? p.description.slice(0, 40) : '无描述' }}</div>
+                <div class="res-meta" v-if="p.referenceImageUrl"><span class="anchor-tag" style="color:#6366f1">📷 参考图已上传</span></div>
+              </div>
             </div>
             <div class="res-actions">
               <button class="icon-btn" :class="{ busy: assetBusy[keyOf('props', p.id)] }" :title="p.imageUrl ? '重新生成道具图' : 'AI 生成道具图'" @click="genProp(p, true)">
@@ -1640,37 +1748,22 @@ onBeforeUnmount(() => {
               @drop.prevent="onSbDrop(i)"
               @dragend="onSbDragEnd(i)"
               @dragleave="dragOverIdx = -1"
-              @mouseenter="hoverSb = i"
-              @mouseleave="hoverSb = -1"
             >
-              <!-- 缩略图：首帧 + 悬停播放预览 -->
               <div class="sb-thumb">
-                <img v-if="sbThumb(sb)" :src="sbThumb(sb)" :alt="`分镜 #${sb.number}`" loading="lazy" />
+                <el-image v-if="sbThumb(sb)" :src="sbThumb(sb)" :alt="`分镜 #${sb.number}`" class="sb-thumb-img" :preview-src-list="[sbThumb(sb)]" preview-teleported fit="cover" />
                 <div v-else class="sb-thumb-null">未生成素材</div>
-                <span v-if="sbHasVideo(sb)" class="sb-vid-badge"><el-icon :size="12"><VideoPlay /></el-icon></span>
-                <!-- 悬停浮层：加载分镜视频并自动播放预览 -->
-                <div v-if="hoverSb === i && sbHasVideo(sb)" class="sb-video-layer" @click.stop>
-                  <video :src="sb.videoUrl || undefined" autoplay muted loop playsinline controls />
-                  <span class="sb-preview-tip">▶ 播放预览中</span>
-                </div>
                 <button class="sb-grip" title="按住拖动排序" @click.stop>⠿</button>
+                <button class="icon-btn danger sb-del" title="删除分镜" @click.stop="removeStoryboard(sb)">
+                  <el-icon :size="14"><Delete /></el-icon>
+                </button>
+                <div class="sb-thumb-bar">
+                  <span class="sb-num">#{{ sb.number }}</span>
+                  <span class="sb-dur">{{ sb.duration }}s</span>
+                  <span class="sb-bar-spacer"></span>
+                  <span v-if="sbHasVideo(sb)" class="sb-bar-video"><el-icon :size="11"><VideoPlay /></el-icon></span>
+                  <span class="badge" :class="statusMeta(sb.status).cls">{{ statusMeta(sb.status).text }}</span>
+                </div>
               </div>
-              <div class="sb-item-top">
-                <span class="sb-num">#{{ sb.number }}</span>
-                <span class="sb-dur"><el-icon :size="12"><VideoCamera /></el-icon>{{ sb.duration }}s</span>
-                <span class="badge" :class="statusMeta(sb.status).cls">{{ statusMeta(sb.status).text }}</span>
-              </div>
-              <p class="sb-dialogue">"{{ sb.dialogue || '（无对白）' }}"</p>
-              <div class="sb-item-meta">
-                <span>{{ sbCharacterNames(sb) }}</span>
-                <span class="dot">·</span>
-                <span>{{ sb.sceneLocation || '无场景' }}</span>
-                <span class="dot">·</span>
-                <span class="dialect-chip">{{ resolveDialect(sb).label }}</span>
-              </div>
-              <button class="icon-btn danger sb-del" title="删除分镜" @click.stop="removeStoryboard(sb)">
-                <el-icon :size="14"><Delete /></el-icon>
-              </button>
             </div>
             <div v-if="storyboards.length === 0" class="empty-tip">暂无分镜，点击右上角「添加分镜」</div>
           </div>
@@ -1678,297 +1771,359 @@ onBeforeUnmount(() => {
 
         <!-- 右侧分镜编辑 -->
         <div v-if="selectedStoryboard" class="sb-edit">
-          <div class="panel-head">
-            <h3 class="panel-title">分镜 #{{ selectedStoryboard.number }} 编辑</h3>
-            <div class="sb-save-actions">
-              <span v-if="autoSavedAt" class="autosave-tip">✓ 已自动保存 {{ autoSavedAt }}</span>
-              <span v-else-if="sbHydrating" class="autosave-tip">保存中…</span>
-              <button class="lmd-btn-primary" @click="saveStoryboard()">保存更改</button>
+          <div class="sb-edit-dock">
+            <div class="panel-head sb-edit-head">
+              <h3 class="panel-title flex items-center gap-2">
+                分镜 #{{ selectedStoryboard.number }} 编辑
+                <span class="badge" :class="statusMeta(selectedStoryboard.status).cls">{{ statusMeta(selectedStoryboard.status).text }}</span>
+              </h3>
+              <div class="sb-save-actions">
+                <span v-if="autoSavedAt" class="autosave-tip">✓ 已自动保存 {{ autoSavedAt }}</span>
+                <span v-else-if="sbHydrating" class="autosave-tip">保存中…</span>
+                <button class="lmd-btn-primary" @click="saveStoryboard()">保存更改</button>
+              </div>
+            </div>
+
+            <!-- 锚点快速跳转 -->
+            <div class="sb-anchor-nav">
+              <button class="sb-anchor" @click="scrollToSection('sb-preview')">画面</button>
+              <button class="sb-anchor" @click="scrollToSection('sb-basic')">关联</button>
+              <button class="sb-anchor" @click="scrollToSection('sb-copy')">文案</button>
+              <button class="sb-anchor" @click="scrollToSection('sb-prompt')">提示词</button>
+              <button class="sb-anchor" @click="scrollToSection('sb-gen')">生成</button>
             </div>
           </div>
 
-          <div class="edit-grid">
-            <div class="prompt-grid">
-              <label class="prompt-item">
-                <span class="prompt-cap">对白
-                  <span class="ai-actions">
-                    <button type="button" class="ai-mini" :disabled="enrichBusy['sb:dialogue']" @click.prevent="enrichSb('dialogue')">
-                      <span v-if="enrichBusy['sb:dialogue']" class="mini-spinner dark" />
-                      <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:dialogue', sbForm.dialogue) }}
-                    </button>
-                    <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:dialogue']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('dialogue', true)">
-                      <el-icon :size="12"><RefreshRight /></el-icon>重新生成
-                    </button>
-                    <el-popover placement="top" :width="280" trigger="click">
-                      <template #reference>
-                        <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:dialogue']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
-                          <el-icon :size="12"><Edit /></el-icon>补充要求
-                        </button>
-                      </template>
-                      <div class="instr-pop">
-                        <div class="instr-title">补充要求 / 风格指令</div>
-                        <p class="instr-hint">可粘贴剧本片段，或写方向（如「更可爱一点、偏悬疑」），AI 生成时会参考。</p>
-                        <el-input v-model="enrichInstr['sb:dialogue']" type="textarea" :rows="3" resize="none" placeholder="例如：参考本集剧本第 3 场，语气更凶狠" />
-                      </div>
-                    </el-popover>
-                  </span>
-                </span>
-                <el-input v-model="sbForm.dialogue" type="textarea" resize="none" :rows="2" placeholder="角色台词，可直接编辑后点 AI 丰富；留空可由 AI 生成" />
-              </label>
-              <label class="prompt-item">
-                <span class="prompt-cap">旁白（画外音）
-                  <span class="ai-actions">
-                    <button type="button" class="ai-mini" :disabled="enrichBusy['sb:narration']" @click.prevent="enrichSb('narration')">
-                      <span v-if="enrichBusy['sb:narration']" class="mini-spinner dark" />
-                      <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:narration', sbForm.narration) }}
-                    </button>
-                    <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:narration']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('narration', true)">
-                      <el-icon :size="12"><RefreshRight /></el-icon>重新生成
-                    </button>
-                    <el-popover placement="top" :width="280" trigger="click">
-                      <template #reference>
-                        <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:narration']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
-                          <el-icon :size="12"><Edit /></el-icon>补充要求
-                        </button>
-                      </template>
-                      <div class="instr-pop">
-                        <div class="instr-title">补充要求 / 风格指令</div>
-                        <p class="instr-hint">可粘贴剧本片段，或写方向（如「更可爱一点、偏悬疑」），AI 生成时会参考。</p>
-                        <el-input v-model="enrichInstr['sb:narration']" type="textarea" :rows="3" resize="none" placeholder="例如：参考本集剧本第 3 场，语气更凶狠" />
-                      </div>
-                    </el-popover>
-                  </span>
-                </span>
-                <el-input v-model="sbForm.narration" type="textarea" resize="none" :rows="2" placeholder="画外音，可编辑后 AI 丰富，或留空由 AI 生成" />
-              </label>
-            </div>
-
-            <el-form label-position="top" class="edit-form">
-              <el-form-item label="角色（可多选）">
-                <el-select v-model="sbForm.characterIds" multiple placeholder="无角色（旁白）" clearable style="width:100%">
-                  <el-option v-for="c in characters" :key="c.id" :value="c.id" :label="`${c.name}（${c.roleLabel || '配角'}）`" />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="场景">
-                <el-select v-model="sbForm.sceneId" placeholder="未选择场景" clearable style="width:100%">
-                  <el-option v-for="s in scenes" :key="s.id" :value="s.id" :label="`${s.location}${s.time ? ' · ' + s.time : ''}`" />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="道具（可多选）">
-                <el-select v-model="sbForm.propIds" multiple placeholder="无道具" clearable style="width:100%">
-                  <el-option v-for="p in props" :key="p.id" :value="p.id" :label="p.name" />
-                </el-select>
-              </el-form-item>
-            </el-form>
-
-            <el-form label-position="top" class="edit-form">
-              <el-form-item label="方言（覆写）">
-                <el-select v-model="sbForm.dialect" placeholder="跟随角色/剧集" clearable style="width:100%">
-                  <el-option v-for="(v, k) in DIALECT_MAP" :key="k" :value="k" :label="v.label" />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="情绪">
-                <el-select v-model="sbForm.emotion" style="width:100%">
-                  <el-option value="neutral" label="平静" />
-                  <el-option value="happy" label="高兴" />
-                  <el-option value="sad" label="悲伤" />
-                  <el-option value="angry" label="愤怒" />
-                  <el-option value="fear" label="恐惧" />
-                  <el-option value="surprise" label="惊讶" />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="时长（秒）">
-                <el-input-number v-model="sbForm.duration" :min="1" :max="30" :step="0.5" style="width:100%" />
-              </el-form-item>
-            </el-form>
-
-            <!-- 分镜关联资产摘要 -->
-            <div class="assoc-label">
-              方言：<span class="dialect-chip strong">{{ resolveDialect(selectedStoryboard).label }}</span>
-              <span class="muted">{{ resolveDialect(selectedStoryboard).level }}</span>
-            </div>
-
-            <!-- 分镜关联资产缩略图 -->
-            <div class="assoc-grid">
-              <div class="assoc-card">
-                <div class="assoc-cap">场景</div>
-                <template v-if="sceneOf(selectedStoryboard)">
-                  <img v-if="sceneOf(selectedStoryboard)!.imageUrl" :src="sceneOf(selectedStoryboard)!.imageUrl || undefined" class="assoc-thumb" />
-                  <div class="assoc-info">
-                    <div class="assoc-name">{{ sceneOf(selectedStoryboard)!.location }}</div>
-                    <div class="assoc-sub">{{ sceneOf(selectedStoryboard)!.time || '未指定时间' }}</div>
-                  </div>
-                </template>
-                <div v-else class="assoc-empty">未选择场景，可在上方下拉选择</div>
+          <!-- ① 画面预览 -->
+          <section class="sb-section" data-sb="sb-preview">
+            <button class="sb-section-head" @click="sbSections.preview = !sbSections.preview">
+              <span class="sb-section-title"><el-icon :size="14"><Picture /></el-icon>画面预览</span>
+              <div class="sb-section-right">
+                <span class="sb-section-summary">{{ selectedStoryboard.imageUrl && selectedStoryboard.videoUrl ? '✓ 图片+视频就绪' : selectedStoryboard.imageUrl ? '图片就绪' : selectedStoryboard.videoUrl ? '视频就绪' : '未生成' }}</span>
+                <el-icon class="sb-chevron" :class="{ open: sbSections.preview }"><ArrowDown /></el-icon>
               </div>
-              <div class="assoc-card">
-                <div class="assoc-cap">角色</div>
-                <template v-if="charsOf(selectedStoryboard).length">
-                  <div v-for="c in charsOf(selectedStoryboard)" :key="c.id" class="assoc-info multi">
-                    <img v-if="c.imageUrl" :src="c.imageUrl || undefined" class="assoc-thumb sm" />
-                    <div>
-                      <div class="assoc-name">{{ c.name }}</div>
-                      <div class="assoc-sub">{{ c.roleLabel || '配角' }}</div>
+            </button>
+            <div v-show="sbSections.preview" class="sb-section-body">
+              <div class="preview-row">
+                <div class="preview-box">
+                  <div class="preview-cap">首帧</div>
+                  <el-image v-if="selectedStoryboard.imageUrl" :src="selectedStoryboard.imageUrl" class="preview-img" :preview-src-list="[selectedStoryboard.imageUrl]" preview-teleported fit="cover" />
+                  <div v-else class="preview-empty">未生成</div>
+                </div>
+                <div class="preview-box">
+                  <div class="preview-cap">尾帧</div>
+                  <el-image v-if="selectedStoryboard.lastFrameUrl" :src="selectedStoryboard.lastFrameUrl" class="preview-img" :preview-src-list="[selectedStoryboard.lastFrameUrl]" preview-teleported fit="cover" />
+                  <div v-else class="preview-empty">未生成</div>
+                </div>
+                <div class="preview-box">
+                  <div class="preview-cap">分镜视频</div>
+                  <video v-if="selectedStoryboard.videoUrl" :src="selectedStoryboard.videoUrl" class="preview-video" controls playsinline />
+                  <div v-else class="preview-empty">未生成</div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ② 关联 & 基本设置 -->
+          <section class="sb-section" data-sb="sb-basic">
+            <button class="sb-section-head" @click="sbSections.basic = !sbSections.basic">
+              <span class="sb-section-title"><el-icon :size="14"><Setting /></el-icon>关联与基本设置</span>
+              <div class="sb-section-right">
+                <span class="sb-section-summary">{{ sbSectionSummary() }}</span>
+                <el-icon class="sb-chevron" :class="{ open: sbSections.basic }"><ArrowDown /></el-icon>
+              </div>
+            </button>
+            <div v-show="sbSections.basic" class="sb-section-body">
+              <div class="sb-basic-grid">
+                <el-form label-position="top" class="edit-form">
+                  <el-form-item label="角色（可多选）">
+                    <el-select v-model="sbForm.characterIds" multiple placeholder="无角色（旁白）" clearable style="width:100%">
+                      <el-option v-for="c in characters" :key="c.id" :value="c.id" :label="`${c.name}（${c.roleLabel || '配角'}）`" />
+                    </el-select>
+                  </el-form-item>
+                  <el-form-item label="场景">
+                    <el-select v-model="sbForm.sceneId" placeholder="未选择场景" clearable style="width:100%">
+                      <el-option v-for="s in scenes" :key="s.id" :value="s.id" :label="`${s.location}${s.time ? ' · ' + s.time : ''}`" />
+                    </el-select>
+                  </el-form-item>
+                  <el-form-item label="道具（可多选）">
+                    <el-select v-model="sbForm.propIds" multiple placeholder="无道具" clearable style="width:100%">
+                      <el-option v-for="p in props" :key="p.id" :value="p.id" :label="p.name" />
+                    </el-select>
+                  </el-form-item>
+                  <el-form-item label="方言（覆写）">
+                    <el-select v-model="sbForm.dialect" placeholder="跟随角色/剧集" clearable style="width:100%">
+                      <el-option v-for="(v, k) in DIALECT_MAP" :key="k" :value="k" :label="v.label" />
+                    </el-select>
+                  </el-form-item>
+                  <el-form-item label="情绪">
+                    <el-select v-model="sbForm.emotion" style="width:100%">
+                      <el-option value="neutral" label="平静" />
+                      <el-option value="happy" label="高兴" />
+                      <el-option value="sad" label="悲伤" />
+                      <el-option value="angry" label="愤怒" />
+                      <el-option value="fear" label="恐惧" />
+                      <el-option value="surprise" label="惊讶" />
+                    </el-select>
+                  </el-form-item>
+                  <el-form-item label="时长（秒）">
+                    <el-input-number v-model="sbForm.duration" :min="1" :max="30" :step="0.5" style="width:100%" />
+                  </el-form-item>
+                </el-form>
+
+                <div class="sb-assoc-panel">
+                  <div class="sb-assoc-head">
+                    关联资产
+                    <span class="sb-assoc-dialect">
+                      方言：
+                      <span class="dialect-chip strong">{{ resolveDialect(selectedStoryboard).label }}</span>
+                      <span class="muted">{{ resolveDialect(selectedStoryboard).level }}</span>
+                    </span>
+                  </div>
+                  <div class="assoc-grid">
+                    <div class="assoc-card">
+                      <div class="assoc-cap">场景</div>
+                      <template v-if="sceneOf(selectedStoryboard)">
+                        <el-image v-if="sceneOf(selectedStoryboard)!.imageUrl" :src="sceneOf(selectedStoryboard)!.imageUrl || undefined" class="assoc-thumb" :preview-src-list="[sceneOf(selectedStoryboard)!.imageUrl!]" preview-teleported fit="cover" />
+                        <div v-else class="assoc-thumb assoc-thumb-null">🏞️</div>
+                        <div class="assoc-info">
+                          <div class="assoc-name">{{ sceneOf(selectedStoryboard)!.location }}</div>
+                          <div class="assoc-sub">{{ sceneOf(selectedStoryboard)!.time || '未指定时间' }}</div>
+                        </div>
+                      </template>
+                      <div v-else class="assoc-empty">未选择场景</div>
+                    </div>
+                    <div class="assoc-card">
+                      <div class="assoc-cap">角色</div>
+                      <div v-if="charsOf(selectedStoryboard).length" class="assoc-multi">
+                        <div v-for="c in charsOf(selectedStoryboard)" :key="c.id" class="assoc-info multi">
+                          <el-image v-if="c.imageUrl" :src="c.imageUrl || undefined" class="assoc-thumb sm" :preview-src-list="[c.imageUrl!]" preview-teleported fit="cover" />
+                          <div v-else class="assoc-avatar-null sm">👤</div>
+                          <div class="min-w-0">
+                            <div class="assoc-name">{{ c.name }}</div>
+                            <div class="assoc-sub">{{ c.roleLabel || '配角' }}</div>
+                          </div>
+                        </div>
+                      </div>
+                      <div v-else class="assoc-empty">无角色（旁白）</div>
+                    </div>
+                    <div class="assoc-card">
+                      <div class="assoc-cap">道具</div>
+                      <div v-if="propsOf(selectedStoryboard).length" class="assoc-multi">
+                        <div v-for="p in propsOf(selectedStoryboard)" :key="p.id" class="assoc-info multi">
+                          <el-image v-if="p.imageUrl" :src="p.imageUrl || undefined" class="assoc-thumb sm" :preview-src-list="[p.imageUrl!]" preview-teleported fit="cover" />
+                          <div v-else class="assoc-avatar-null sm">🪑</div>
+                          <div class="min-w-0">
+                            <div class="assoc-name">{{ p.name }}</div>
+                            <div class="assoc-sub">{{ p.type || '未分类' }}</div>
+                          </div>
+                        </div>
+                      </div>
+                      <div v-else class="assoc-empty">未选择道具</div>
                     </div>
                   </div>
-                </template>
-                <div v-else class="assoc-empty">无角色（旁白）</div>
-              </div>
-              <div class="assoc-card">
-                <div class="assoc-cap">道具</div>
-                <template v-if="propsOf(selectedStoryboard).length">
-                  <div v-for="p in propsOf(selectedStoryboard)" :key="p.id" class="assoc-info multi">
-                    <img v-if="p.imageUrl" :src="p.imageUrl || undefined" class="assoc-thumb sm" />
-                    <div>
-                      <div class="assoc-name">{{ p.name }}</div>
-                      <div class="assoc-sub">{{ p.type || '未分类' }}</div>
-                    </div>
-                  </div>
-                </template>
-                <div v-else class="assoc-empty">未选择道具</div>
+                </div>
               </div>
             </div>
+          </section>
 
-            <!-- 画面预览：首帧 / 尾帧 / 视频 -->
-            <div class="preview-row">
-              <div class="preview-box">
-                <div class="preview-cap">首帧</div>
-                <img v-if="selectedStoryboard.imageUrl" :src="selectedStoryboard.imageUrl" class="preview-img" />
-                <div v-else class="preview-empty">未生成</div>
+          <!-- ③ 文案（对白 / 旁白 / 画面描述） -->
+          <section class="sb-section" data-sb="sb-copy">
+            <button class="sb-section-head" @click="sbSections.copy = !sbSections.copy">
+              <span class="sb-section-title"><el-icon :size="14"><Edit /></el-icon>文案与描述</span>
+              <div class="sb-section-right">
+                <span class="sb-section-summary">对白 / 旁白 / 画面 / 动作</span>
+                <el-icon class="sb-chevron" :class="{ open: sbSections.copy }"><ArrowDown /></el-icon>
               </div>
-              <div class="preview-box">
-                <div class="preview-cap">尾帧</div>
-                <img v-if="selectedStoryboard.lastFrameUrl" :src="selectedStoryboard.lastFrameUrl" class="preview-img" />
-                <div v-else class="preview-empty">未生成</div>
-              </div>
-              <div class="preview-box">
-                <div class="preview-cap">分镜视频</div>
-                <video v-if="selectedStoryboard.videoUrl" :src="selectedStoryboard.videoUrl" class="preview-img" controls playsinline />
-                <div v-else class="preview-empty">未生成</div>
-              </div>
-            </div>
-
-            <!-- 画面描述（场景描述 / 动作描述，注入生图与生视频提示词） -->
-            <div class="prompt-grid">
-              <label class="prompt-item">
-                <span class="prompt-cap">场景描述（本镜画面内容 / 机位 / 构图）
-                  <span class="ai-actions">
-                    <button type="button" class="ai-mini" :disabled="enrichBusy['sb:sceneDescription']" @click.prevent="enrichSb('sceneDescription')">
-                      <span v-if="enrichBusy['sb:sceneDescription']" class="mini-spinner dark" />
-                      <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:sceneDescription', sbForm.sceneDescription) }}
-                    </button>
-                    <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:sceneDescription']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('sceneDescription', true)">
-                      <el-icon :size="12"><RefreshRight /></el-icon>重新生成
-                    </button>
-                    <el-popover placement="top" :width="280" trigger="click">
-                      <template #reference>
-                        <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:sceneDescription']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
-                          <el-icon :size="12"><Edit /></el-icon>补充要求
-                        </button>
-                      </template>
-                      <div class="instr-pop">
-                        <div class="instr-title">补充要求 / 风格指令</div>
-                        <p class="instr-hint">可粘贴剧本片段，或写方向（如「更可爱一点、偏悬疑」），AI 生成时会参考。</p>
-                        <el-input v-model="enrichInstr['sb:sceneDescription']" type="textarea" :rows="3" resize="none" placeholder="例如：参考本集剧本第 3 场，画面更压抑" />
-                      </div>
-                    </el-popover>
+            </button>
+            <div v-show="sbSections.copy" class="sb-section-body">
+              <div class="prompt-grid">
+                <label class="prompt-item">
+                  <span class="prompt-cap">对白
+                    <span class="ai-actions">
+                      <button type="button" class="ai-mini" :disabled="enrichBusy['sb:dialogue']" @click.prevent="enrichSb('dialogue')">
+                        <span v-if="enrichBusy['sb:dialogue']" class="mini-spinner dark" />
+                        <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:dialogue', sbForm.dialogue) }}
+                      </button>
+                      <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:dialogue']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('dialogue', true)">
+                        <el-icon :size="12"><RefreshRight /></el-icon>重新生成
+                      </button>
+                      <el-popover placement="top" :width="280" trigger="click">
+                        <template #reference>
+                          <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:dialogue']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
+                            <el-icon :size="12"><Edit /></el-icon>补充要求
+                          </button>
+                        </template>
+                        <div class="instr-pop">
+                          <div class="instr-title">补充要求 / 风格指令</div>
+                          <p class="instr-hint">可粘贴剧本片段，或写方向（如「更可爱一点、偏悬疑」），AI 生成时会参考。</p>
+                          <el-input v-model="enrichInstr['sb:dialogue']" type="textarea" :rows="3" resize="none" placeholder="例如：参考本集剧本第 3 场，语气更凶狠" />
+                        </div>
+                      </el-popover>
+                    </span>
                   </span>
-                </span>
-                <el-input v-model="sbForm.sceneDescription" type="textarea" resize="none" :rows="2" placeholder="留空则自动按角色 + 场景 + 道具合成；可编辑后 AI 丰富" />
-              </label>
-              <label class="prompt-item">
-                <span class="prompt-cap">动作描述（角色动作与镜头运动）
-                  <span class="ai-actions">
-                    <button type="button" class="ai-mini" :disabled="enrichBusy['sb:motionDescription']" @click.prevent="enrichSb('motionDescription')">
-                      <span v-if="enrichBusy['sb:motionDescription']" class="mini-spinner dark" />
-                      <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:motionDescription', sbForm.motionDescription) }}
-                    </button>
-                    <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:motionDescription']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('motionDescription', true)">
-                      <el-icon :size="12"><RefreshRight /></el-icon>重新生成
-                    </button>
-                    <el-popover placement="top" :width="280" trigger="click">
-                      <template #reference>
-                        <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:motionDescription']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
-                          <el-icon :size="12"><Edit /></el-icon>补充要求
-                        </button>
-                      </template>
-                      <div class="instr-pop">
-                        <div class="instr-title">补充要求 / 风格指令</div>
-                        <p class="instr-hint">可粘贴剧本片段，或写方向（如「镜头更急促、推近」），AI 生成时会参考。</p>
-                        <el-input v-model="enrichInstr['sb:motionDescription']" type="textarea" :rows="3" resize="none" placeholder="例如：动作幅度更大，镜头快速推近" />
-                      </div>
-                    </el-popover>
+                  <el-input v-model="sbForm.dialogue" type="textarea" :autosize="{ minRows: 2, maxRows: 8 }" resize="none" placeholder="角色台词，可直接编辑后点 AI 丰富；留空可由 AI 生成" />
+                </label>
+                <label class="prompt-item">
+                  <span class="prompt-cap">旁白（画外音）
+                    <span class="ai-actions">
+                      <button type="button" class="ai-mini" :disabled="enrichBusy['sb:narration']" @click.prevent="enrichSb('narration')">
+                        <span v-if="enrichBusy['sb:narration']" class="mini-spinner dark" />
+                        <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:narration', sbForm.narration) }}
+                      </button>
+                      <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:narration']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('narration', true)">
+                        <el-icon :size="12"><RefreshRight /></el-icon>重新生成
+                      </button>
+                      <el-popover placement="top" :width="280" trigger="click">
+                        <template #reference>
+                          <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:narration']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
+                            <el-icon :size="12"><Edit /></el-icon>补充要求
+                          </button>
+                        </template>
+                        <div class="instr-pop">
+                          <div class="instr-title">补充要求 / 风格指令</div>
+                          <p class="instr-hint">可粘贴剧本片段，或写方向（如「更可爱一点、偏悬疑」），AI 生成时会参考。</p>
+                          <el-input v-model="enrichInstr['sb:narration']" type="textarea" :rows="3" resize="none" placeholder="例如：参考本集剧本第 3 场，语气更凶狠" />
+                        </div>
+                      </el-popover>
+                    </span>
                   </span>
-                </span>
-                <el-input v-model="sbForm.motionDescription" type="textarea" resize="none" :rows="2" placeholder="留空则默认轻微运动；可编辑后 AI 丰富" />
-              </label>
-            </div>
-
-            <!-- 上传参考图（区别于 AI 生成首帧，可作为生图参考） -->
-            <div class="ref-row">
-              <button class="lmd-btn-ghost" @click="openRefPicker('storyboard', selectedStoryboard.id)">
-                <el-icon class="mr-1" :size="14"><Upload /></el-icon>上传参考图
-              </button>
-              <img v-if="selectedStoryboard.referenceImageUrl" :src="selectedStoryboard.referenceImageUrl" class="ref-thumb" />
-              <span v-if="selectedStoryboard.referenceImageUrl" class="ref-name">参考图已上传（可作生图参考）</span>
-            </div>
-
-            <!-- 画面提示词 -->
-            <div class="prompt-grid">
-              <label class="prompt-item">
-                <span class="prompt-cap">图片提示词
-                  <span class="ai-actions">
-                    <button type="button" class="ai-mini" :disabled="enrichBusy['sb:imagePrompt']" @click.prevent="enrichSb('imagePrompt')">
-                      <span v-if="enrichBusy['sb:imagePrompt']" class="mini-spinner dark" />
-                      <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:imagePrompt', sbForm.imagePrompt) }}
-                    </button>
-                    <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:imagePrompt']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('imagePrompt', true)">
-                      <el-icon :size="12"><RefreshRight /></el-icon>重新生成
-                    </button>
-                    <el-popover placement="top" :width="280" trigger="click">
-                      <template #reference>
-                        <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:imagePrompt']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
-                          <el-icon :size="12"><Edit /></el-icon>补充要求
-                        </button>
-                      </template>
-                      <div class="instr-pop">
-                        <div class="instr-title">补充要求 / 风格指令</div>
-                        <p class="instr-hint">可粘贴剧本片段，或写方向（如「偏赛博朋克、冷色调」），AI 生成时会参考。</p>
-                        <el-input v-model="enrichInstr['sb:imagePrompt']" type="textarea" :rows="3" resize="none" placeholder="例如：参考本集剧本第 3 场视觉，冷色调" />
-                      </div>
-                    </el-popover>
+                  <el-input v-model="sbForm.narration" type="textarea" :autosize="{ minRows: 2, maxRows: 8 }" resize="none" placeholder="画外音，可编辑后 AI 丰富，或留空由 AI 生成" />
+                </label>
+                <label class="prompt-item">
+                  <span class="prompt-cap">场景描述（本镜画面内容 / 机位 / 构图）
+                    <span class="ai-actions">
+                      <button type="button" class="ai-mini" :disabled="enrichBusy['sb:sceneDescription']" @click.prevent="enrichSb('sceneDescription')">
+                        <span v-if="enrichBusy['sb:sceneDescription']" class="mini-spinner dark" />
+                        <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:sceneDescription', sbForm.sceneDescription) }}
+                      </button>
+                      <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:sceneDescription']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('sceneDescription', true)">
+                        <el-icon :size="12"><RefreshRight /></el-icon>重新生成
+                      </button>
+                      <el-popover placement="top" :width="280" trigger="click">
+                        <template #reference>
+                          <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:sceneDescription']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
+                            <el-icon :size="12"><Edit /></el-icon>补充要求
+                          </button>
+                        </template>
+                        <div class="instr-pop">
+                          <div class="instr-title">补充要求 / 风格指令</div>
+                          <p class="instr-hint">可粘贴剧本片段，或写方向（如「更可爱一点、偏悬疑」），AI 生成时会参考。</p>
+                          <el-input v-model="enrichInstr['sb:sceneDescription']" type="textarea" :rows="3" resize="none" placeholder="例如：参考本集剧本第 3 场，画面更压抑" />
+                        </div>
+                      </el-popover>
+                    </span>
                   </span>
-                </span>
-                <el-input v-model="sbForm.imagePrompt" type="textarea" resize="none" :rows="2" placeholder="留空则由系统按角色锚点 + 场景 + 道具自动合成；可编辑后 AI 丰富" />
-              </label>
-              <label class="prompt-item">
-                <span class="prompt-cap">视频提示词
-                  <span class="ai-actions">
-                    <button type="button" class="ai-mini" :disabled="enrichBusy['sb:videoPrompt']" @click.prevent="enrichSb('videoPrompt')">
-                      <span v-if="enrichBusy['sb:videoPrompt']" class="mini-spinner dark" />
-                      <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:videoPrompt', sbForm.videoPrompt) }}
-                    </button>
-                    <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:videoPrompt']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('videoPrompt', true)">
-                      <el-icon :size="12"><RefreshRight /></el-icon>重新生成
-                    </button>
-                    <el-popover placement="top" :width="280" trigger="click">
-                      <template #reference>
-                        <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:videoPrompt']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
-                          <el-icon :size="12"><Edit /></el-icon>补充要求
-                        </button>
-                      </template>
-                      <div class="instr-pop">
-                        <div class="instr-title">补充要求 / 风格指令</div>
-                        <p class="instr-hint">可粘贴剧本片段，或写方向（如「运镜更平稳、慢推」），AI 生成时会参考。</p>
-                        <el-input v-model="enrichInstr['sb:videoPrompt']" type="textarea" :rows="3" resize="none" placeholder="例如：参考本集剧本第 3 场，运镜更平稳" />
-                      </div>
-                    </el-popover>
+                  <el-input v-model="sbForm.sceneDescription" type="textarea" :autosize="{ minRows: 2, maxRows: 8 }" resize="none" placeholder="留空则自动按角色 + 场景 + 道具合成；可编辑后 AI 丰富" />
+                </label>
+                <label class="prompt-item">
+                  <span class="prompt-cap">动作描述（角色动作与镜头运动）
+                    <span class="ai-actions">
+                      <button type="button" class="ai-mini" :disabled="enrichBusy['sb:motionDescription']" @click.prevent="enrichSb('motionDescription')">
+                        <span v-if="enrichBusy['sb:motionDescription']" class="mini-spinner dark" />
+                        <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:motionDescription', sbForm.motionDescription) }}
+                      </button>
+                      <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:motionDescription']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('motionDescription', true)">
+                        <el-icon :size="12"><RefreshRight /></el-icon>重新生成
+                      </button>
+                      <el-popover placement="top" :width="280" trigger="click">
+                        <template #reference>
+                          <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:motionDescription']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
+                            <el-icon :size="12"><Edit /></el-icon>补充要求
+                          </button>
+                        </template>
+                        <div class="instr-pop">
+                          <div class="instr-title">补充要求 / 风格指令</div>
+                          <p class="instr-hint">可粘贴剧本片段，或写方向（如「镜头更急促、推近」），AI 生成时会参考。</p>
+                          <el-input v-model="enrichInstr['sb:motionDescription']" type="textarea" :rows="3" resize="none" placeholder="例如：动作幅度更大，镜头快速推近" />
+                        </div>
+                      </el-popover>
+                    </span>
                   </span>
-                </span>
-                <el-input v-model="sbForm.videoPrompt" type="textarea" resize="none" :rows="2" placeholder="留空则自动生成，并注入角色外貌硬约束；可编辑后 AI 丰富" />
-              </label>
+                  <el-input v-model="sbForm.motionDescription" type="textarea" :autosize="{ minRows: 2, maxRows: 8 }" resize="none" placeholder="留空则默认轻微运动；可编辑后 AI 丰富" />
+                </label>
+              </div>
             </div>
+          </section>
 
+          <!-- ④ 提示词 & 参考图 -->
+          <section class="sb-section" data-sb="sb-prompt">
+            <button class="sb-section-head" @click="sbSections.prompt = !sbSections.prompt">
+              <span class="sb-section-title"><el-icon :size="14"><MagicStick /></el-icon>提示词 & 参考图</span>
+              <div class="sb-section-right">
+                <span class="sb-section-summary">图片 / 视频提示词</span>
+                <el-icon class="sb-chevron" :class="{ open: sbSections.prompt }"><ArrowDown /></el-icon>
+              </div>
+            </button>
+            <div v-show="sbSections.prompt" class="sb-section-body">
+              <div class="prompt-grid">
+                <label class="prompt-item">
+                  <span class="prompt-cap">图片提示词
+                    <span class="ai-actions">
+                      <button type="button" class="ai-mini" :disabled="enrichBusy['sb:imagePrompt']" @click.prevent="enrichSb('imagePrompt')">
+                        <span v-if="enrichBusy['sb:imagePrompt']" class="mini-spinner dark" />
+                        <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:imagePrompt', sbForm.imagePrompt) }}
+                      </button>
+                      <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:imagePrompt']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('imagePrompt', true)">
+                        <el-icon :size="12"><RefreshRight /></el-icon>重新生成
+                      </button>
+                      <el-popover placement="top" :width="280" trigger="click">
+                        <template #reference>
+                          <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:imagePrompt']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
+                            <el-icon :size="12"><Edit /></el-icon>补充要求
+                          </button>
+                        </template>
+                        <div class="instr-pop">
+                          <div class="instr-title">补充要求 / 风格指令</div>
+                          <p class="instr-hint">可粘贴剧本片段，或写方向（如「偏赛博朋克、冷色调」），AI 生成时会参考。</p>
+                          <el-input v-model="enrichInstr['sb:imagePrompt']" type="textarea" :rows="3" resize="none" placeholder="例如：参考本集剧本第 3 场视觉，冷色调" />
+                        </div>
+                      </el-popover>
+                    </span>
+                  </span>
+                  <el-input v-model="sbForm.imagePrompt" type="textarea" :autosize="{ minRows: 2, maxRows: 10 }" resize="none" placeholder="留空则由系统按角色锚点 + 场景 + 道具自动合成；可编辑后 AI 丰富" />
+                </label>
+                <label class="prompt-item">
+                  <span class="prompt-cap">视频提示词
+                    <span class="ai-actions">
+                      <button type="button" class="ai-mini" :disabled="enrichBusy['sb:videoPrompt']" @click.prevent="enrichSb('videoPrompt')">
+                        <span v-if="enrichBusy['sb:videoPrompt']" class="mini-spinner dark" />
+                        <el-icon v-else :size="12"><MagicStick /></el-icon>{{ aiBtnLabel('sb:videoPrompt', sbForm.videoPrompt) }}
+                      </button>
+                      <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:videoPrompt']" title="丢弃当前内容，换一版全新的" @click.prevent="enrichSb('videoPrompt', true)">
+                        <el-icon :size="12"><RefreshRight /></el-icon>重新生成
+                      </button>
+                      <el-popover placement="top" :width="280" trigger="click">
+                        <template #reference>
+                          <button type="button" class="ai-mini ghost" :disabled="enrichBusy['sb:videoPrompt']" title="补充要求 / 风格指令（可粘贴剧本片段或写方向）">
+                            <el-icon :size="12"><Edit /></el-icon>补充要求
+                          </button>
+                        </template>
+                        <div class="instr-pop">
+                          <div class="instr-title">补充要求 / 风格指令</div>
+                          <p class="instr-hint">可粘贴剧本片段，或写方向（如「运镜更平稳、慢推」），AI 生成时会参考。</p>
+                          <el-input v-model="enrichInstr['sb:videoPrompt']" type="textarea" :rows="3" resize="none" placeholder="例如：参考本集剧本第 3 场，运镜更平稳" />
+                        </div>
+                      </el-popover>
+                    </span>
+                  </span>
+                  <el-input v-model="sbForm.videoPrompt" type="textarea" :autosize="{ minRows: 2, maxRows: 10 }" resize="none" placeholder="留空则自动生成，并注入角色外貌硬约束；可编辑后 AI 丰富" />
+                </label>
+              </div>
+
+              <!-- 上传参考图 -->
+              <div class="ref-row">
+                <button class="lmd-btn-ghost" @click="openRefPicker('storyboard', selectedStoryboard.id)">
+                  <el-icon class="mr-1" :size="14"><Upload /></el-icon>上传参考图
+                </button>
+                <el-image v-if="selectedStoryboard.referenceImageUrl" :src="selectedStoryboard.referenceImageUrl" class="ref-thumb" :preview-src-list="[selectedStoryboard.referenceImageUrl]" preview-teleported fit="cover" />
+                <span v-if="selectedStoryboard.referenceImageUrl" class="ref-name">参考图已上传（可作生图参考）</span>
+              </div>
+            </div>
+          </section>
+
+          <!-- ⑤ 生成操作（sticky 底部操作条） -->
+          <div class="sb-gen-bar" data-sb="sb-gen">
             <div class="gen-row">
               <button class="lmd-btn-ghost" :disabled="!!assetBusy['sb-image']" @click="genSbImage(!!selectedStoryboard.imageUrl)">
                 <span v-if="assetBusy['sb-image']" class="mini-spinner dark" />
@@ -1979,7 +2134,8 @@ onBeforeUnmount(() => {
                 <el-icon v-else class="mr-1" :size="14"><VideoCamera /></el-icon>生成视频
               </button>
               <button class="lmd-btn-ghost" :disabled="!!assetBusy['sb-video']" @click="genSbVideo(true)">
-                <el-icon class="mr-1" :size="14"><RefreshRight /></el-icon>重新生成视频
+                <span v-if="assetBusy['sb-video']" class="mini-spinner dark" />
+                <el-icon v-else class="mr-1" :size="14"><RefreshRight /></el-icon>重新生成视频
               </button>
             </div>
           </div>
@@ -2065,20 +2221,29 @@ onBeforeUnmount(() => {
       </section>
     </main>
 
-    <!-- 底部生成日志（SSE 实时） -->
-    <footer class="lmd-logbar">
-      <div ref="terminalEl" class="lmd-terminal">
+    <!-- 底部生成日志（SSE 实时，可展开/收起） -->
+    <footer class="lmd-logbar" :class="{ collapsed: !logOpen }">
+      <div class="lmd-terminal">
         <div class="log-head">
-          <span class="log-title">生成日志</span>
-          <button class="log-clear" @click="logs = []">清空</button>
-        </div>
-        <div v-if="logs.length === 0" class="log-empty">等待生成任务...</div>
-        <div v-else class="log-list">
-          <div v-for="l in logs" :key="l.id" class="log-line" :class="l.level">
-            <span class="log-time">{{ new Date(l.at).toLocaleTimeString() }}</span>
-            {{ l.text }}
+          <button class="log-toggle" @click="logOpen = !logOpen">
+            <el-icon :size="14"><ArrowDown /></el-icon>
+            <span class="log-title">生成日志</span>
+            <span v-if="logs.length" class="log-badge">{{ logs.length }}</span>
+          </button>
+          <div class="log-head-right">
+            <span v-if="generating || mergeRunning" class="log-live"><span class="log-live-dot" />实时</span>
+            <button class="log-clear" @click="logs = []">清空</button>
           </div>
-          <div v-if="generating || mergeRunning" class="log-cursor">█</div>
+        </div>
+        <div ref="terminalEl" v-show="logOpen" class="lmd-terminal-body">
+          <div v-if="logs.length === 0" class="log-empty">等待生成任务...</div>
+          <div v-else class="log-list">
+            <div v-for="l in logs" :key="l.id" class="log-line" :class="l.level">
+              <span class="log-time">{{ new Date(l.at).toLocaleTimeString() }}</span>
+              {{ l.text }}
+            </div>
+            <div v-if="generating || mergeRunning" class="log-cursor">█</div>
+          </div>
         </div>
       </div>
     </footer>
@@ -2473,8 +2638,8 @@ onBeforeUnmount(() => {
   position: sticky; top: 0; z-index: 30; backdrop-filter: blur(8px);
 }
 .lmd-topbar-inner {
-  max-width: 1080px; margin: 0 auto; width: 100%;
-  display: flex; align-items: center; justify-content: space-between; padding: 14px 20px;
+  max-width: 1440px; margin: 0 auto; width: 100%;
+  display: flex; align-items: center; justify-content: space-between; padding: 14px 24px;
 }
 .lmd-back-btn { width: 38px; height: 38px; border-radius: 10px; background: #eef2f7; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--text-2); transition: background .2s; }
 .lmd-back-btn:hover { background: #e2e8f0; }
@@ -2483,11 +2648,11 @@ onBeforeUnmount(() => {
 
 /* 步进条 */
 .lmd-stepper { border-bottom: 1px solid var(--border); background: var(--card); padding: 10px 0; position: sticky; top: 67px; z-index: 20; }
-.lmd-stepper-inner { max-width: 1080px; margin: 0 auto; padding: 0 20px; display: flex; gap: 8px; flex-wrap: wrap; }
+.lmd-stepper-inner { max-width: 1440px; margin: 0 auto; padding: 0 24px; display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* 成片进度流程图 */
 .pipeline-box { border-bottom: 1px solid var(--border); background: linear-gradient(180deg, #eef2ff, #fff); }
-.pipeline-inner { max-width: 1080px; margin: 0 auto; padding: 12px 20px; }
+.pipeline-inner { max-width: 1440px; margin: 0 auto; padding: 12px 24px; }
 .pipeline-title { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; color: var(--text); }
 .pipeline-tag { font-size: 12px; font-weight: 600; color: var(--indigo); background: var(--indigo-soft); padding: 2px 10px; border-radius: 999px; }
 .pipeline-percent { margin-left: auto; font-size: 13px; font-weight: 700; color: var(--indigo); }
@@ -2513,6 +2678,20 @@ onBeforeUnmount(() => {
 .pipeline-label { font-size: 11px; color: var(--text-2); white-space: nowrap; }
 .pipeline-step.active .pipeline-label { color: var(--indigo); font-weight: 700; }
 .pipeline-status { margin-top: 8px; font-size: 12px; color: var(--indigo); font-weight: 600; }
+.pipeline-detail { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
+.pdetail-block { display: flex; align-items: flex-start; gap: 8px; }
+.pdetail-cap { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 700; color: var(--text-2); flex-shrink: 0; width: 44px; padding-top: 3px; }
+.pdetail-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.pdetail-pill {
+  font-size: 12px; color: var(--text-2); background: #fff; border: 1px solid var(--border);
+  border-radius: 999px; padding: 2px 10px; line-height: 1.5; max-width: 180px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pdetail-pill.done { color: #059669; background: var(--emerald-soft); border-color: rgba(16,185,129,.4); }
+.pdetail-pill.half { color: #b45309; background: var(--amber); background: rgba(245,158,11,.12); border-color: rgba(245,158,11,.4); }
+.pdetail-pill.busy { border-color: var(--indigo); box-shadow: 0 0 0 2px var(--indigo-soft); }
+.pdetail-pill svg { margin-left: 4px; }
+
 .lmd-step {
   font-size: 14px; font-weight: 600; color: var(--text-2); cursor: pointer;
   padding: 7px 14px; border-radius: 999px; border: 1px solid rgba(99,102,241,0.25); background: var(--screen-soft);
@@ -2523,25 +2702,28 @@ onBeforeUnmount(() => {
 .lmd-step-count { font-size: 11px; margin-left: 5px; opacity: .75; }
 
 /* 主内容 */
-.lmd-main { flex: 1; max-width: 1080px; margin: 0 auto; width: 100%; padding: 20px 20px 220px; }
+.lmd-main { flex: 1; max-width: 1440px; margin: 0 auto; width: 100%; padding: 20px 24px 220px; }
 .panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
 .panel-title { font-size: 16px; font-weight: 700; color: var(--text); margin: 0; }
 .muted { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 4px; }
 
 /* 资源网格 */
-.res-grid { padding: 16px; display: grid; grid-template-columns: repeat(auto-fill,minmax(280px,1fr)); gap: 12px; }
-.res-card { display: flex; align-items: flex-start; gap: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 12px; transition: border-color .2s, box-shadow .2s; }
+.res-grid { padding: 16px; display: grid; grid-template-columns: repeat(auto-fill,minmax(300px,1fr)); gap: 12px; }
+.res-card { display: flex; flex-direction: column; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 12px; transition: border-color .2s, box-shadow .2s; }
 .res-card:hover { border-color: #c7d2fe; box-shadow: var(--shadow-sm); }
+.res-top { display: flex; align-items: flex-start; gap: 12px; }
 .res-avatar { width: 44px; height: 44px; border-radius: 10px; background: var(--screen-soft); display: flex; align-items: center; justify-content: center; font-size: 22px; flex-shrink: 0; overflow: hidden; }
-.res-thumb { width: 100%; height: 100%; object-fit: cover; }
+.res-thumb { width: 100%; height: 100%; object-fit: cover; cursor: zoom-in; }
+:deep(.res-thumb.el-image) { width: 100%; height: 100%; cursor: zoom-in; }
+:deep(.res-thumb.el-image img) { width: 100%; height: 100%; object-fit: cover; }
 .anchor-tag { color: var(--emerald); font-weight: 600; }
 .mini-spinner { width: 12px; height: 12px; border: 2px solid rgba(99,102,241,.25); border-top-color: var(--indigo); border-radius: 50%; animation: spin .7s linear infinite; display: inline-block; }
 .mini-spinner.dark { border-color: rgba(100,116,139,.3); border-top-color: var(--text-2); }
 .icon-btn.busy { cursor: progress; opacity: .7; }
-.res-body { flex: 1; min-width: 0; }
-.res-name { font-weight: 600; color: var(--text); font-size: 14px; display: flex; align-items: center; gap: 6px; }
-.res-meta { font-size: 12px; color: var(--muted); margin-top: 3px; }
-.res-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.res-body { flex: 1; min-width: 0; width: 100%; }
+.res-name { font-weight: 600; color: var(--text); font-size: 14px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.res-meta { font-size: 12px; color: var(--muted); margin-top: 3px; line-height: 1.5; }
+.res-actions { display: flex; gap: 6px; padding-top: 10px; border-top: 1px dashed var(--border); }
 .icon-btn { width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--border); background: #fff; color: var(--text-2); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all .2s; }
 .icon-btn:hover { background: var(--screen-soft); color: var(--indigo); }
 .icon-btn.danger:hover { background: var(--rose-soft); color: var(--rose); border-color: #fecdd3; }
@@ -2549,11 +2731,11 @@ onBeforeUnmount(() => {
 .form-hint { margin: 6px 0 0; font-size: 12px; color: var(--muted); line-height: 1.5; }
 
 /* 分镜布局 */
-.sb-layout { display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: start; }
-.sb-list { background: var(--card); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; position: sticky; top: 132px; max-height: 70vh; display: flex; flex-direction: column; }
+.sb-layout { display: grid; grid-template-columns: minmax(380px, 460px) minmax(0, 1fr); gap: 16px; align-items: start; }
+.sb-list { background: var(--card); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; position: sticky; top: 132px; display: flex; flex-direction: column; }
 .sb-list-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--border); }
-.sb-list-body { overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
-.sb-item { position: relative; padding: 8px; border: 1px solid var(--border); border-radius: 12px; cursor: pointer; transition: all .2s; background: #fff; }
+.sb-list-body { padding: 10px; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; align-content: start; }
+.sb-item { position: relative; padding: 6px; border: 1px solid var(--border); border-radius: 12px; cursor: pointer; transition: all .2s; background: #fff; }
 .sb-item:hover { border-color: #c7d2fe; }
 .sb-item.active { background: var(--screen-soft); border-color: var(--indigo); }
 .sb-item[draggable="true"] { cursor: grab; }
@@ -2561,33 +2743,33 @@ onBeforeUnmount(() => {
 .sb-item.dragging { opacity: 0.55; border-style: dashed; }
 .sb-item.drag-over { border-color: var(--indigo); box-shadow: 0 0 0 2px var(--indigo-soft); transform: translateY(2px); }
 /* 分镜缩略图（时间线画布） */
-.sb-thumb { position: relative; aspect-ratio: 16 / 10; border-radius: 8px; overflow: hidden; background: #eef2f7; margin-bottom: 8px; display: flex; align-items: center; justify-content: center; }
-.sb-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.sb-thumb { position: relative; aspect-ratio: 16 / 10; border-radius: 8px; overflow: hidden; background: #eef2f7; display: flex; align-items: center; justify-content: center; }
+.sb-thumb img, :deep(.sb-thumb-img.el-image) { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
+:deep(.sb-thumb-img.el-image img) { width: 100%; height: 100%; object-fit: cover; cursor: zoom-in; }
 .sb-thumb-null { color: var(--muted); font-size: 12px; }
-.sb-vid-badge { position: absolute; left: 6px; bottom: 6px; width: 22px; height: 22px; border-radius: 50%; background: rgba(0,0,0,0.55); color: #fff; display: flex; align-items: center; justify-content: center; }
-.sb-grip { position: absolute; right: 6px; top: 6px; width: 26px; height: 26px; border: none; background: rgba(255,255,255,0.85); border-radius: 6px; color: var(--text-2); cursor: grab; display: flex; align-items: center; justify-content: center; font-size: 16px; line-height: 1; opacity: 0; transition: opacity .2s; }
+.sb-thumb-bar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: linear-gradient(to top, rgba(15,23,42,0.78), rgba(15,23,42,0)); }
+.sb-thumb-bar .sb-num { color: #fff; }
+.sb-thumb-bar .sb-dur { color: #cbd5e1; }
+.sb-bar-spacer { flex: 1; }
+.sb-bar-video { display: inline-flex; color: #fff; }
+.sb-grip { position: absolute; left: 6px; top: 6px; width: 26px; height: 26px; border: none; background: rgba(255,255,255,0.85); border-radius: 6px; color: var(--text-2); cursor: grab; display: flex; align-items: center; justify-content: center; font-size: 16px; line-height: 1; opacity: 0; transition: opacity .2s; }
 .sb-item:hover .sb-grip { opacity: 1; }
 .sb-grip:active { cursor: grabbing; }
-.sb-video-layer { position: absolute; inset: 0; background: #000; z-index: 3; }
-.sb-video-layer video { width: 100%; height: 100%; object-fit: contain; }
-.sb-preview-tip { position: absolute; left: 50%; bottom: 6px; transform: translateX(-50%); font-size: 10px; color: #fff; background: rgba(0,0,0,0.6); padding: 1px 8px; border-radius: 999px; white-space: nowrap; pointer-events: none; }
-.sb-item-top { display: flex; align-items: center; gap: 6px; }
 .sb-num { font-weight: 700; color: var(--indigo); font-size: 13px; }
 .sb-dur { font-size: 11px; color: var(--muted); }
 .badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; }
 .lmd-badge-emerald { background: var(--emerald-soft); color: #059669; }
 .lmd-badge-indigo { background: var(--screen-soft); color: var(--indigo); }
 .lmd-badge-gray { background: #f1f5f9; color: var(--muted); }
-.sb-dialogue { font-size: 13px; color: var(--text); margin: 8px 0 6px; line-height: 1.4; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-.sb-item-meta { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-.dot { opacity: .5; }
 .dialect-chip { background: #eef2ff; color: #4f46e5; border-radius: 6px; padding: 1px 6px; font-size: 11px; }
 .dialect-chip.strong { color: #6d28d9; font-weight: 600; }
 .sb-del { position: absolute; top: 8px; right: 8px; opacity: 0; transition: opacity .2s; }
 .sb-item:hover .sb-del { opacity: 1; }
 
 /* 分镜编辑 */
-.sb-edit { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; }
+.sb-edit { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; display: flex; flex-direction: column; gap: 12px; position: sticky; top: 132px; max-height: calc(100vh - 148px); overflow-y: auto; }
+.sb-edit-dock { position: sticky; top: 0; z-index: 6; background: var(--card); padding-bottom: 6px; }
+.sb-edit-head { margin-bottom: 0; }
 .edit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .edit-grid > .el-textarea, .assoc-label, .gen-row { grid-column: 1 / -1; }
 .edit-form { margin: 0; }
@@ -2595,6 +2777,43 @@ onBeforeUnmount(() => {
 .assoc-label { font-size: 13px; color: var(--text-2); display: flex; align-items: center; gap: 8px; }
 .gen-row { display: flex; gap: 10px; flex-wrap: wrap; }
 .lmd-btn-ghost.sm { padding: 4px 10px; font-size: 12px; }
+
+/* 锚点导航 */
+.sb-anchor-nav { display: flex; gap: 6px; flex-wrap: wrap; z-index: 5; background: rgba(255,255,255,0.95); padding: 6px; border: 1px solid var(--border); border-radius: 12px; backdrop-filter: blur(6px); }
+.sb-anchor {
+  flex: 1; font-size: 12px; font-weight: 600; color: var(--text-2); background: var(--screen-soft);
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 0; cursor: pointer; transition: all .2s; text-align: center;
+}
+.sb-anchor:hover { color: var(--indigo); border-color: var(--indigo); background: transparent; }
+
+/* 分镜编辑区块（可折叠卡片） */
+.sb-section { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: #fff; scroll-margin-top: 104px; }
+.sb-section-head {
+  width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 12px; background: #f8fafc; border-bottom: 1px solid var(--border); cursor: pointer;
+  border: none; text-align: left; transition: background .2s;
+}
+.sb-section-head:hover { background: #f1f5f9; }
+.sb-section-title { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 700; color: var(--text); }
+.sb-section-right { display: inline-flex; align-items: center; gap: 8px; }
+.sb-section-summary { font-size: 11px; color: var(--muted); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-chevron { transition: transform .2s; color: var(--muted); font-size: 13px; }
+.sb-chevron.open { transform: rotate(180deg); }
+.sb-section-body { padding: 14px; }
+.sb-section-body > * + * { margin-top: 12px; }
+
+/* 基本设置：表单 + 关联资产两栏 */
+.sb-basic-grid { display: grid; grid-template-columns: 1fr 1.1fr; gap: 16px; }
+.sb-assoc-panel { border: 1px dashed var(--border); border-radius: 12px; padding: 12px; background: #fafbff; }
+.sb-assoc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; font-weight: 700; color: var(--text-2); margin-bottom: 10px; flex-wrap: wrap; }
+.sb-assoc-dialect { display: inline-flex; align-items: center; gap: 6px; font-weight: 400; font-size: 12px; color: var(--text-2); }
+.assoc-multi { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.assoc-avatar-null { background: var(--screen-soft); border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 16px; }
+.assoc-avatar-null.sm { width: 28px; height: 28px; font-size: 13px; }
+.assoc-thumb-null { display: flex; align-items: center; justify-content: center; font-size: 18px; }
+
+/* 生成操作条 */
+.sb-gen-bar { border-top: 1px solid var(--border); padding-top: 12px; position: sticky; bottom: 0; background: rgba(255,255,255,0.98); z-index: 4; backdrop-filter: blur(6px); }
 
 /* 分镜关联资产 */
 .assoc-grid { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
@@ -2615,7 +2834,9 @@ onBeforeUnmount(() => {
 .preview-row { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
 .preview-box { border: 1px solid var(--border); border-radius: 12px; padding: 8px; text-align: center; }
 .preview-cap { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
-.preview-img { width: 100%; max-height: 220px; border-radius: 8px; object-fit: cover; background: #0f172a; }
+.preview-img { width: 100%; max-height: 260px; border-radius: 8px; object-fit: cover; background: #0f172a; display: block; cursor: zoom-in; }
+.preview-video { width: 100%; max-height: 260px; border-radius: 8px; background: #000; object-fit: contain; }
+:deep(.preview-img.el-image) { width: 100%; max-height: 260px; border-radius: 8px; }
 .preview-empty { height: 96px; display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--muted); background: #f8fafc; border-radius: 8px; }
 
 /* 画面提示词 */
@@ -2663,14 +2884,23 @@ onBeforeUnmount(() => {
 .merge-placeholder { margin-top: 16px; font-size: 13px; color: var(--muted); background: var(--screen-soft); border-radius: 10px; padding: 14px; text-align: center; }
 
 /* 生成日志 */
-.lmd-logbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; padding: 0 20px 14px; pointer-events: none; }
-.lmd-terminal { pointer-events: auto; max-width: 1080px; margin: 0 auto; background: #0f172a; color: #cbd5e1; border-radius: 14px 14px 0 0; box-shadow: 0 -6px 24px rgba(15,23,42,.25); overflow: hidden; }
-.log-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid rgba(148,163,184,.15); }
-.log-title { font-size: 13px; font-weight: 700; color: #e2e8f0; }
+.lmd-logbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; padding: 0 24px 0; pointer-events: none; display: flex; }
+.lmd-terminal { pointer-events: auto; max-width: 1440px; margin: 0 auto; background: #0f172a; color: #cbd5e1; border-radius: 14px 14px 0 0; box-shadow: 0 -6px 24px rgba(15,23,42,.25); overflow: hidden; width: 100%; }
+.log-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 14px; border-bottom: 1px solid rgba(148,163,184,.15); cursor: pointer; }
+.log-toggle { display: inline-flex; align-items: center; gap: 6px; background: transparent; border: none; color: #e2e8f0; cursor: pointer; padding: 0; }
+.log-toggle .el-icon { transition: transform .2s; color: #64748b; }
+.lmd-logbar.collapsed .log-toggle .el-icon { transform: rotate(180deg); }
+.log-title { font-size: 13px; font-weight: 700; }
+.log-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; font-size: 11px; font-weight: 700; color: #fff; background: var(--indigo); border-radius: 999px; }
+.log-head-right { display: inline-flex; align-items: center; gap: 10px; }
+.log-live { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: #34d399; font-weight: 600; }
+.log-live-dot { width: 7px; height: 7px; border-radius: 50%; background: #34d399; animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.3; } }
 .log-clear { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 12px; }
 .log-clear:hover { color: #e2e8f0; }
 .log-empty { padding: 12px 14px; font-size: 13px; color: #64748b; }
-.log-list { max-height: 148px; overflow-y: auto; padding: 8px 14px 12px; font-size: 13px; line-height: 1.8; font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; }
+.lmd-terminal-body { max-height: 220px; overflow: hidden; }
+.log-list { max-height: 204px; overflow-y: auto; padding: 8px 14px 12px; font-size: 13px; line-height: 1.8; font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; }
 .log-line.success { color: #34d399; }
 .log-line.warn { color: #fbbf24; }
 .log-line.error { color: #f87171; }
@@ -2684,13 +2914,18 @@ onBeforeUnmount(() => {
 @media (max-width: 860px) {
   .sb-layout, .merge-layout { grid-template-columns: 1fr; }
   .sb-list { position: static; max-height: none; }
+  .sb-basic-grid, .prompt-grid, .assoc-grid { grid-template-columns: 1fr; }
+  .pdetail-cap { width: 36px; }
+  .sb-anchor { flex: none; }
 }
 
 /* 分镜自动保存 / 参考图上传 */
 .sb-save-actions { display: flex; align-items: center; gap: 10px; }
 .autosave-tip { font-size: 12px; color: #059669; }
 .ref-row { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.ref-thumb { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; border: 1px solid var(--border); }
+.ref-thumb { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; border: 1px solid var(--border); cursor: zoom-in; }
+:deep(.ref-thumb.el-image) { width: 44px; height: 44px; flex-shrink: 0; }
+:deep(.ref-thumb.el-image img) { width: 100%; height: 100%; object-fit: cover; }
 .ref-name { font-size: 12px; color: var(--muted); }
 
 /* 一键生成选项弹窗 */

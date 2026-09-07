@@ -4,7 +4,6 @@ import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { ArrowLeft, Plus, Edit, Delete, VideoPlay, MagicStick, Refresh, Upload } from '@element-plus/icons-vue';
 import { dramaApi, episodeApi, generateApi } from '@/api';
-import { DIALECT_MAP, COVER_STYLES } from '@/utils/dialect';
 import type { Drama, Episode } from '@/types';
 
 const route = useRoute();
@@ -12,7 +11,6 @@ const router = useRouter();
 const dramaId = Number(route.params.id);
 
 const loading = ref(false);
-const savingDialect = ref(false);
 const project = ref<Drama | null>(null);
 const episodes = ref<Episode[]>([]);
 
@@ -38,60 +36,9 @@ async function loadAll() {
   }
 }
 
-// 方言下拉：修改即保存
-async function onDialectChange() {
-  if (!project.value) return;
-  savingDialect.value = true;
-  try {
-    await dramaApi.update(dramaId, { dialect: project.value.dialect || 'standard' });
-    ElMessage.success(`默认方言已保存为「${DIALECT_MAP[project.value.dialect || 'standard']?.label}」`);
-  } catch (e: any) {
-    ElMessage.error(e.message);
-    await loadAll();
-  } finally {
-    savingDialect.value = false;
-  }
-}
-
-// ===== 项目设置弹窗 =====
-const showProjectModal = ref(false);
-const savingProject = ref(false);
-const form = reactive({
-  title: '',
-  description: '',
-  dialect: 'standard',
-  coverStyle: 'default',
-});
-
-function openProjectSettings() {
-  if (!project.value) return;
-  form.title = project.value.title;
-  form.description = project.value.description || '';
-  form.dialect = project.value.dialect || 'standard';
-  form.coverStyle = project.value.coverStyle || 'default';
-  showProjectModal.value = true;
-}
-
-async function saveProject() {
-  if (!form.title.trim()) {
-    ElMessage.warning('请输入项目名称');
-    return;
-  }
-  savingProject.value = true;
-  try {
-    project.value = await dramaApi.update(dramaId, {
-      title: form.title.trim(),
-      description: form.description,
-      dialect: form.dialect,
-      coverStyle: form.coverStyle,
-    });
-    showProjectModal.value = false;
-    ElMessage.success('项目已更新');
-  } catch (e: any) {
-    ElMessage.error(e.message);
-  } finally {
-    savingProject.value = false;
-  }
+// ===== 进入项目管理编辑页 =====
+function openProjectEdit() {
+  router.push(`/project/${dramaId}/edit`);
 }
 
 // ===== 新建分集：创建空集并进入剧本编辑 =====
@@ -297,7 +244,7 @@ onMounted(loadAll);
           </div>
         </div>
         <div class="flex items-center gap-3">
-          <button class="lmd-btn-ghost" @click="openProjectSettings">
+          <button class="lmd-btn-ghost" @click="openProjectEdit" title="编辑项目名称、描述与默认方言等">
             <el-icon class="mr-1"><Edit /></el-icon>项目设置
           </button>
           <button class="lmd-btn-ghost" @click="openProduce" title="排队跑完所有分集成片流水线，带整剧进度">
@@ -329,20 +276,12 @@ onMounted(loadAll);
             <p class="lmd-overview-text">{{ project?.description || '暂无描述' }}</p>
           </div>
           <div>
-            <h3 class="lmd-overview-label">默认方言</h3>
-            <select
-              class="lmd-input"
-              :value="project?.dialect || 'standard'"
-              :disabled="savingDialect || !project"
-              @change="project && (project.dialect = ($event.target as HTMLSelectElement).value); onDialectChange()"
-            >
-              <option v-for="(v, k) in DIALECT_MAP" :key="k" :value="k">{{ v.label }}</option>
-            </select>
-            <p class="lmd-range-hint mt-1">{{ savingDialect ? '保存中...' : '修改后立即保存' }}</p>
-          </div>
-          <div>
             <h3 class="lmd-overview-label">角色数量</h3>
             <p class="text-2xl font-bold" style="color: var(--indigo)">{{ project?.characterCount || 0 }}</p>
+          </div>
+          <div>
+            <h3 class="lmd-overview-label">分集数量</h3>
+            <p class="text-2xl font-bold" style="color: var(--purple)">{{ episodes.length }}</p>
           </div>
         </div>
       </div>
@@ -412,41 +351,6 @@ onMounted(loadAll);
         </div>
       </div>
     </main>
-
-    <!-- ===== 项目设置弹窗 ===== -->
-    <div v-if="showProjectModal" class="lmd-mask" @click.self="showProjectModal = false">
-      <div class="lmd-modal">
-        <h3 class="lmd-modal-title">项目设置</h3>
-        <div class="space-y-4 mt-6">
-          <div>
-            <label class="lmd-label">项目名称</label>
-            <input v-model="form.title" class="lmd-input" type="text" placeholder="例如：霸道总裁爱上我" />
-          </div>
-          <div>
-            <label class="lmd-label">项目描述</label>
-            <textarea v-model="form.description" rows="3" class="lmd-input" placeholder="简要描述剧情..."></textarea>
-          </div>
-          <div>
-            <label class="lmd-label">默认方言</label>
-            <select v-model="form.dialect" class="lmd-input">
-              <option v-for="(v, k) in DIALECT_MAP" :key="k" :value="k">{{ v.label }}</option>
-            </select>
-          </div>
-          <div>
-            <label class="lmd-label">封面风格</label>
-            <select v-model="form.coverStyle" class="lmd-input">
-              <option v-for="c in COVER_STYLES" :key="c.value" :value="c.value">{{ c.label }}</option>
-            </select>
-          </div>
-        </div>
-        <div class="flex justify-end gap-3 mt-6">
-          <button class="lmd-btn-ghost" @click="showProjectModal = false">取消</button>
-          <button class="lmd-btn-primary" :disabled="savingProject" @click="saveProject">
-            {{ savingProject ? '保存中...' : '保存' }}
-          </button>
-        </div>
-      </div>
-    </div>
 
     <!-- ===== 一键导入整本剧本弹窗 ===== -->
     <div v-if="importModal.show" class="lmd-mask" @click.self="importModal.show = false">

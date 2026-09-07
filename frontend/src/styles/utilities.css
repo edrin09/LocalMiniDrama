@@ -9,6 +9,7 @@
 .grid { display: grid; }
 .flex-col { flex-direction: column; }
 .flex-1 { flex: 1 1 0%; }
+.min-w-0 { min-width: 0; }
 
 /* Position / 布局上下文 */
 .relative { position: relative; }
@@ -22,6 +23,7 @@
 .min-h-screen { min-height: 100vh; }
 .max-w-5xl { max-width: 64rem; }
 .max-w-7xl { max-width: 80rem; }
+.max-w-9xl { max-width: 96rem; }
 .mx-auto { margin-right: auto; margin-left: auto; }
 
 /* 外边距 */

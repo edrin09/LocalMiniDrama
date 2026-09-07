@@ -22,6 +22,12 @@ const router = createRouter({
       meta: { title: '分集管理' },
     },
     {
+      path: '/project/:id/edit',
+      name: 'project-edit',
+      component: () => import('@/views/ProjectEdit.vue'),
+      meta: { title: '项目管理编辑' },
+    },
+    {
       path: '/project/:id/episode/:eid',
       name: 'episode-edit',
       component: () => import('@/views/EpisodeEdit.vue'),

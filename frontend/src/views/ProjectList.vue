@@ -11,9 +11,8 @@ const router = useRouter();
 const loading = ref(false);
 const projects = ref<Drama[]>([]);
 
-// ===== 新建 / 编辑项目 表单 =====
+// ===== 新建项目 表单 =====
 const showProjectModal = ref(false);
-const editingId = ref<number | null>(null);
 const savingProject = ref(false);
 const form = reactive({
   title: '',
@@ -47,20 +46,10 @@ async function loadProjects() {
 }
 
 function openCreate() {
-  editingId.value = null;
   form.title = '';
   form.description = '';
   form.dialect = 'standard';
   form.coverStyle = 'default';
-  showProjectModal.value = true;
-}
-
-function openEdit(p: Drama) {
-  editingId.value = p.id;
-  form.title = p.title;
-  form.description = p.description || '';
-  form.dialect = p.dialect || 'standard';
-  form.coverStyle = p.coverStyle || 'default';
   showProjectModal.value = true;
 }
 
@@ -75,23 +64,13 @@ async function saveProject() {
   }
   savingProject.value = true;
   try {
-    if (editingId.value) {
-      await dramaApi.update(editingId.value, {
-        title: form.title.trim(),
-        description: form.description,
-        dialect: form.dialect,
-        coverStyle: form.coverStyle,
-      });
-      ElMessage.success('项目已更新');
-    } else {
-      await dramaApi.create({
-        title: form.title.trim(),
-        description: form.description,
-        dialect: form.dialect,
-        coverStyle: form.coverStyle,
-      });
-      ElMessage.success('项目创建成功');
-    }
+    await dramaApi.create({
+      title: form.title.trim(),
+      description: form.description,
+      dialect: form.dialect,
+      coverStyle: form.coverStyle,
+    });
+    ElMessage.success('项目创建成功');
     showProjectModal.value = false;
     await loadProjects();
   } catch (e: any) {
@@ -287,7 +266,7 @@ onMounted(loadProjects);
 
           <!-- 操作 -->
           <div class="px-5 pb-5 flex gap-2" @click.stop>
-            <button class="lmd-card-btn" @click="openEdit(p)">
+            <button class="lmd-card-btn" @click.stop="router.push(`/project/${p.id}/edit`)">
               <el-icon :size="14"><Edit /></el-icon>编辑
             </button>
             <button class="lmd-card-btn" @click="exportProject(p)">
@@ -304,7 +283,7 @@ onMounted(loadProjects);
     <!-- ===== 新建 / 编辑项目弹窗 ===== -->
     <div v-if="showProjectModal" class="lmd-mask" @click.self="closeModal">
       <div class="lmd-modal">
-        <h3 class="lmd-modal-title">{{ editingId ? '编辑项目' : '创建新短剧项目' }}</h3>
+        <h3 class="lmd-modal-title">创建新短剧项目</h3>
         <div class="space-y-4 mt-6">
           <div>
             <label class="lmd-label">项目名称</label>

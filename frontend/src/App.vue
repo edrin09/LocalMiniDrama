@@ -1,12 +1,11 @@
 <script setup lang="ts">
 import { RouterLink, RouterView } from 'vue-router';
-import { Film, Collection } from '@element-plus/icons-vue';
+import { Film } from '@element-plus/icons-vue';
 import { useRoute } from 'vue-router';
 
 const route = useRoute();
 const NAV = [
   { to: '/', label: '项目', icon: Film },
-  { to: '/assets', label: '资产', icon: Collection },
 ];
 const isActive = (to: string) =>
   to === '/' ? route.path === '/' : route.path.startsWith(to);
@@ -57,5 +56,5 @@ const isActive = (to: string) =>
 }
 .nav-item:hover { background: #f1f5f9; }
 .nav-item.active { background: var(--indigo-soft); color: var(--indigo); }
-.app-main { flex: 1; min-width: 0; overflow-y: auto; }
+.app-main { flex: 1; min-width: 0; }
 </style>
