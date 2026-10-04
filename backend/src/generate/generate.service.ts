@@ -15,6 +15,21 @@ import { PromptService } from '../ai/prompt.service';
 import { GenStyle, anchorStyleTag } from '../ai/prompt.service';
 import { FfmpegService } from '../ai/ffmpeg.service';
 import { ProviderAuthError, ProviderTransientError } from '../ai/provider.types';
+// 剧本拆解的纯逻辑已抽离到 script-parse.util.ts（无 IO，可单测）
+import {
+  ParsedScript,
+  CHUNK_CHARS,
+  splitScriptChunks,
+  mergeParsed,
+  extractJsonObject,
+  normStr,
+  normEmotion,
+  normDuration,
+  normalizeNameKey,
+  locTimeKey,
+  matchName,
+  normalizeParsedScript,
+} from './script-parse.util';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -62,39 +77,109 @@ export interface GenerateEpisodeOpts {
 const clampSeconds = (duration?: number | null) =>
   String(Math.min(12, Math.max(4, Math.round(duration ?? 5))));
 
-/** AI 剧本拆解的结构化产物（已规范化：空名剔除、取值夹取） */
-export interface ParsedScript {
-  characters: Array<{
-    name: string;
-    role: string | null;
-    roleLabel: string | null;
-    appearance: string | null;
-    intro: string | null;
-  }>;
-  scenes: Array<{
-    location: string;
-    time: string | null;
-    description: string | null;
-  }>;
-  props: Array<{
-    name: string;
-    type: string | null;
-    description: string | null;
-  }>;
-  storyboards: Array<{
-    characters: string[];
-    character: string | null;
-    scene: string | null;
-    prop: string | null;
-    dialogue: string | null;
-    narration: string | null;
-    sceneDescription: string | null;
-    motionDescription: string | null;
-    emotion: string;
-    duration: number;
-  }>;
+/**
+ * 首帧 VLM 自动质检的最大生成次数（含首次）。
+ * 取 2：审核不合格时再重画一次并把问题追加进提示词；
+ * 每多一次就多一轮生图开销（生图远贵于审核），因此不做更多次重试。
+ */
+const AUDIT_MAX_ATTEMPT = 2;
+
+/**
+ * 分镜首帧参考图上限（Agnes Image Flash 硬限制，超出直接 HTTP 400）。
+ * 官方参考：reference 模式最多 5 张。
+ */
+export const FIRST_FRAME_REF_CAP = 5;
+
+/**
+ * 分镜首帧参考图候选（尚未做预算裁剪，也尚未解析成可传输的 uri）
+ */
+export interface FirstFrameRefCandidate {
+  kind: 'character' | 'scene' | 'prop' | 'tail';
+  name: string;
+  /** 本地 /uploads 路径，需转 Data URI */
+  url?: string | null;
+  /** 远端原始直链，可直接作为参考图 */
+  remote?: string | null;
+  /** 已解析好的参考图（远端直链或 Data URI），存在时优先 */
+  uri?: string | null;
 }
 
+/** 实际注入的参考图（uri 必存在，顺序即注入顺序） */
+export interface FirstFrameRef extends FirstFrameRefCandidate {
+  uri: string;
+}
+
+/** 参考图优先级分配结果 */
+export interface FirstFrameRefAllocation {
+  /** 实际采纳的参考图（顺序即注入顺序，第 1 张 = 主体） */
+  refs: FirstFrameRef[];
+  /** 因预算不足被丢弃的角色名 */
+  droppedCharacters: string[];
+  /** 因预算不足被丢弃的道具名 */
+  droppedProps: string[];
+  /** 场景图是否被丢弃 */
+  sceneDropped: boolean;
+}
+
+/**
+ * 首帧参考图优先级分配（纯函数，便于单测）。
+ *
+ * 优先级：角色立绘 > 场景图 > 道具图 > 上一镜尾帧。
+ * 依据：
+ * - 官方示例「第一个图 = 主体」，角色立绘必须排最前，否则身份会被场景/道具稀释；
+ * - 场景图是场景一致性的唯一来源（此前完全没注入，是「分镜很烂」的第一根因）；
+ * - 尾帧仅保证镜头连续，代价是可能带入上一镜的元素，因此优先级最低。
+ *
+ * 场景图排在道具之前，是因为道具数量不可控（多选道具可达数个），
+ * 而场景对本镜几乎是必需项。
+ */
+export function allocateFirstFrameRefs(
+  candidates: FirstFrameRefCandidate[],
+  cap: number = FIRST_FRAME_REF_CAP,
+): FirstFrameRefAllocation {
+  const order: Record<FirstFrameRefCandidate['kind'], number> = {
+    character: 0,
+    scene: 1,
+    prop: 2,
+    tail: 3,
+  };
+  // 候选必须已有可传输的 uri 才参与分配（url/remote 尚未解析的先跳过）
+  const usable = candidates.filter((c): c is FirstFrameRef => Boolean(c.uri));
+  // 稳定排序：同类保持输入顺序（角色顺序 = 出场重要性，主体角色排在前面）
+  const sorted = [...usable].sort((a, b) => order[a.kind] - order[b.kind]);
+
+  const refs: FirstFrameRef[] = [];
+  const droppedCharacters: string[] = [];
+  const droppedProps: string[] = [];
+  let sceneDropped = false;
+
+  // 场景图与说话人同为 P0（同框人数一多，角色必然挤掉场景图）。
+  // 这里给场景预留 1 个名额：非说话人角色再多，也不能把场景一致性整个挤没。
+  const hasScene = sorted.some((c) => c.kind === 'scene');
+  const otherCap = hasScene ? Math.max(0, cap - 1) : cap;
+  let nonSceneUsed = 0;
+
+  for (const c of sorted) {
+    if (c.kind === 'scene') {
+      if (refs.length < cap) refs.push(c);
+      else sceneDropped = true;
+      continue;
+    }
+    if (nonSceneUsed < otherCap) {
+      refs.push(c);
+      nonSceneUsed++;
+      continue;
+    }
+    if (c.kind === 'character') droppedCharacters.push(c.name);
+    else if (c.kind === 'prop') droppedProps.push(c.name);
+    // tail 被丢弃属正常，无需上报
+  }
+
+  // 输出顺序固定为 角色 → 场景 → 道具 → 尾帧（官方：第 1 张 = 主体）
+  refs.sort((a, b) => order[a.kind] - order[b.kind]);
+
+  return { refs, droppedCharacters, droppedProps, sceneDropped };
+}
 type LoadedStoryboard = {
   id: number;
   episodeId: number;
@@ -137,6 +222,10 @@ export class GenerateService {
   private dramaRunning = new Set<number>();
   /** 单分镜任务锁 */
   private sbRunning = new Set<number>();
+  /** 单分镜配音锁（防重入） */
+  private dubRunning = new Set<number>();
+  /** 整集配音锁 */
+  private dubRunningEpisode = new Set<number>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -244,8 +333,11 @@ export class GenerateService {
   }
 
   private async runScene(s: any, opts: { quad?: boolean } = {}, style?: GenStyle) {
-    const quad = opts.quad ?? s.useQuadGrid;
-    const tag = `场景「${s.location}」${quad ? '（四宫格）' : '（单图）'}`;
+    // 四宫格已停用（方案 B-2）：项目内没有图像切割代码，四宫格产物是一张 2x2 拼图，
+    // 一旦被当作「单张场景参考图」注入首帧，模型会把拼图当成完整画面 → 反而更糟。
+    // 统一生成单图，等将来引入 sharp 切图（quadUrls）后再恢复。
+    const quad = false;
+    const tag = `场景「${s.location}」（单图）`;
     const charCtx = await this.roleNameContext(s.episode.dramaId);
     const asset = await this.image({
       episodeId: s.episodeId,
@@ -262,7 +354,8 @@ export class GenerateService {
         data: {
           imageUrl: asset.url,
           sourceUrl: asset.remote ?? null,
-          useQuadGrid: quad,
+          // 强制落 false：避免历史四宫格标记残留，导致旧拼图被当单图参考注入
+          useQuadGrid: false,
         },
       });
       this.logBus.emit(s.episodeId, {
@@ -294,8 +387,9 @@ export class GenerateService {
   }
 
   private async runProp(p: any, opts: { quad?: boolean } = {}, style?: GenStyle) {
-    const quad = opts.quad ?? p.useQuadGrid;
-    const tag = `道具「${p.name}」${quad ? '（四视图）' : '（单图）'}`;
+    // 同 runScene：四视图已停用（无切图能力，拼图不能当单图参考）
+    const quad = false;
+    const tag = `道具「${p.name}」（单图）`;
     const charCtx = await this.roleNameContext(p.episode.dramaId);
     const asset = await this.image({
       episodeId: p.episodeId,
@@ -312,7 +406,7 @@ export class GenerateService {
         data: {
           imageUrl: asset.url,
           sourceUrl: asset.remote ?? null,
-          useQuadGrid: quad,
+          useQuadGrid: false, // 同上：四视图已停用
         },
       });
       this.logBus.emit(p.episodeId, {
@@ -330,7 +424,12 @@ export class GenerateService {
 
   async generateStoryboardImage(storyboardId: number, opts: { force?: boolean } = {}) {
     const sb = await this.loadStoryboard(storyboardId);
-    if (sb.imageUrl && sb.lastFrameUrl && !opts.force) {
+    // 首帧是主体产物，尾帧只是可选的衔接图。
+    // 此前用「首帧+尾帧都存在」作为跳过条件，导致尾帧一旦生成失败，
+    // 之后每次点击都会把首帧重画一遍 —— 人物形象在反复重画中不断漂移。
+    const needTail = this.needsTailFrame(sb);
+    const done = sb.imageUrl && (!needTail || sb.lastFrameUrl);
+    if (done && !opts.force) {
       this.log(sb.episodeId, 'info', `[分镜#${sb.number}] 参考图已存在，跳过`);
       return { started: false, episodeId: sb.episodeId, reason: 'already_generated' };
     }
@@ -338,15 +437,48 @@ export class GenerateService {
     return { started: true, episodeId: sb.episodeId, storyboardId: sb.id };
   }
 
+  /**
+   * 是否需要为本镜生成尾帧。
+   * 只有存在明确动作/运镜、且画面里有可动主体时才值得生成；
+   * 静态对话镜与空镜的尾帧与首帧几乎相同，白花钱且只会放大人物漂移。
+   */
+  private needsTailFrame(sb: {
+    motionDescription?: string | null;
+    sceneDescription?: string | null;
+    characters?: any[] | null;
+    character?: any;
+  }): boolean {
+    const hasSubject = (sb.characters?.length ?? 0) > 0 || !!sb.character;
+    if (!hasSubject) return false; // 空镜无「动作后的结束状态」
+    return Boolean((sb.motionDescription || '').trim());
+  }
+
+  /**
+   * 本镜与上一镜是否属于同一场景。
+   * 判据：都挂了场景则比 sceneId；只有一方挂了场景则视为不同场景（宁可不做衔接，
+   * 也不能拿别的场景的画面去污染本镜）；双方都没挂场景则视为同一空环境，允许衔接。
+   */
+  private async isSameSceneAsPrev(sb: { episodeId: number; number: number; sceneId?: number | null }): Promise<boolean> {
+    const prev = await this.prisma.storyboard.findFirst({
+      where: { episodeId: sb.episodeId, deletedAt: null, number: { lt: sb.number } },
+      orderBy: { number: 'desc' },
+      select: { sceneId: true },
+    });
+    if (!prev) return false; // 首镜没有上一镜
+    if (prev.sceneId && sb.sceneId) return prev.sceneId === sb.sceneId;
+    return !prev.sceneId && !sb.sceneId;
+  }
+
   async runStoryboardImage(
     sb: LoadedStoryboard,
     opts: { force?: boolean } = {},
     style?: GenStyle,
   ) {
-    if (sb.imageUrl && sb.lastFrameUrl && !opts.force) return;
-
-    // force 重生成时丢弃旧提示词，避免被当作「自定义提示词」拼接造成指令冲突
-    if (opts.force) sb.imagePrompt = null;
+    // 与 generateStoryboardImage 保持同一套「是否已完成」判定
+    const needTail = this.needsTailFrame(sb);
+    if (sb.imageUrl && (!needTail || sb.lastFrameUrl) && !opts.force) return;
+    // force 只重画首帧时（首帧已存在、仅缺尾帧），不要丢弃已保存的自定义首帧提示词
+    if (opts.force && !(sb.imageUrl && !needTail && !sb.lastFrameUrl)) sb.imagePrompt = null;
 
     // 记录被替换前的旧文件，新文件落库后物理删除，避免重生成堆积孤儿
     const oldFirst = sb.imageUrl;
@@ -360,11 +492,16 @@ export class GenerateService {
       prop: sb.prop,
       props: sb.props,
       refNames: [] as string[],
+      refs: [] as Array<{ kind: 'character' | 'scene' | 'prop' | 'tail'; name: string }>,
       hasTailRef: false,
     };
 
-    // 跨分镜一致性参考：优先注入所有选中角色的形象图（整剧共享，锁定人物外貌与服装），
-    // 再衔接上一镜视频尾帧（保证镜头连续）。
+    // 跨分镜一致性参考：角色立绘（锁定人物外貌与服装）+ 场景图（锁定空间与色调）
+    // + 道具图 + 上一镜尾帧（锁定镜头连续）。
+    //
+    // 硬约束：Agnes 生图参考图上限 5 张，超出会直接 HTTP 400。
+    // 必须按优先级裁剪：说话人立绘 > 场景图 > 其他同框角色 > 道具图 > 上一镜尾帧。
+    //
     // 注意：本地 /uploads/... 是 Web 路径，必须先转磁盘绝对路径再读 Data URI，
     // 直接丢给 fs.exists 全程 false（Windows 已复现，曾导致角色形象图从未真正注入、
     // 人物与服装完全漂移）；远端 http(s) URL 可直接作为参考图传入。
@@ -374,64 +511,200 @@ export class GenerateService {
       if (abs) return this.storage.toDataUri(abs);
       return /^https?:\/\//i.test(url) ? url : null;
     };
+
     const charList: any[] = sb.characters?.length
       ? sb.characters
       : sb.character
         ? [sb.character]
         : [];
-    const references: string[] = [];
-    for (const ch of charList) {
-      const ref = await refOf(ch?.imageUrl);
-      if (ref) {
-        references.push(ref);
-        ctx.refNames.push(String(ch?.name ?? ''));
+    const propList: any[] = sb.props?.length ? sb.props : sb.prop ? [sb.prop] : [];
+
+    // 尾帧衔接只在「同一场景」时才有意义：跨场景时把上一镜尾帧当参考，
+    // 模型会把上一场景的环境元素带进新场景（这是分镜观感崩坏的主要来源）。
+    // 尾帧优先级最低，因此最后才查询，预算不足时可直接跳过。
+    const sameSceneAsPrev = await this.isSameSceneAsPrev(sb);
+
+    // 参考图解析（含 Data URI 转换）后交给纯函数做优先级裁剪，保证分配逻辑可单测。
+    const candidates: FirstFrameRefCandidate[] = [
+      ...charList.map((c: any) => ({
+        kind: 'character' as const,
+        name: String(c?.name ?? ''),
+        url: c?.imageUrl,
+        remote: c?.sourceUrl,
+      })),
+      ...(sb.scene
+        ? [{ kind: 'scene' as const, name: String(sb.scene.location ?? '场景'), url: sb.scene.imageUrl, remote: sb.scene.sourceUrl }]
+        : []),
+      ...propList.map((p: any) => ({
+        kind: 'prop' as const,
+        name: String(p?.name ?? ''),
+        url: p?.imageUrl,
+        remote: p?.sourceUrl,
+      })),
+    ];
+    if (sameSceneAsPrev) {
+      const prevTail = await this.prevTailFrame(sb.episodeId, sb.number);
+      if (prevTail) {
+        const tailUri = await this.storage.toDataUri(prevTail);
+        if (tailUri) {
+          candidates.push({ kind: 'tail', name: '上一镜尾帧', uri: tailUri });
+        }
       }
     }
-    const prevTail = await this.prevTailFrame(sb.episodeId, sb.number);
-    if (prevTail) {
-      const tailRef = await this.storage.toDataUri(prevTail);
-      if (tailRef) {
-        references.push(tailRef);
-        ctx.hasTailRef = true;
-        this.log(sb.episodeId, 'info', `[分镜#${sb.number}] 已衔接上一镜尾帧作为画面参考`);
-      }
+
+    // 解析每个候选为可用参考图（远端直链优先，其次本地 Data URI）
+    const resolved: Array<FirstFrameRefCandidate & { uri: string }> = [];
+    for (const c of candidates) {
+      if (!c.url && !c.uri) continue;
+      const uri =
+        (c.remote && /^https?:\/\//i.test(c.remote) ? c.remote : null) ??
+        (await refOf(c.url)) ??
+        c.uri ??
+        null;
+      if (uri) resolved.push({ ...c, uri });
     }
-    if (ctx.refNames.length > 0) {
+
+    const alloc = allocateFirstFrameRefs(resolved, FIRST_FRAME_REF_CAP);
+    const references = alloc.refs.map((r) => r.uri);
+    ctx.refs = alloc.refs.map((r) => ({ kind: r.kind, name: r.name }));
+    ctx.refNames = alloc.refs.filter((r) => r.kind === 'character').map((r) => r.name);
+    ctx.hasTailRef = alloc.refs.some((r) => r.kind === 'tail');
+
+    const refLabel = alloc.refs.map((r, i) => `${i + 1}=${r.name}`).join('、');
+    if (references.length > 0) {
       this.log(
         sb.episodeId,
         'info',
-        `[分镜#${sb.number}] 已注入角色形象参考图：${ctx.refNames.join('、')}`,
+        `[分镜#${sb.number}] 注入参考图 ${references.length}/${FIRST_FRAME_REF_CAP}：${refLabel}`,
+      );
+    }
+    if (alloc.droppedCharacters.length > 0) {
+      this.log(
+        sb.episodeId,
+        'warn',
+        `[分镜#${sb.number}] 参考图超限，角色「${alloc.droppedCharacters.join('、')}」未注入形象参考，仅靠文字锚点锁定，易漂移`,
+      );
+    }
+    if (alloc.sceneDropped && sb.scene) {
+      this.log(
+        sb.episodeId,
+        'warn',
+        `[分镜#${sb.number}] 场景图未注入（预算不足或场景尚未生成），本镜场景一致性将依赖文字描述`,
+      );
+    }
+    if (alloc.droppedProps.length > 0) {
+      this.log(
+        sb.episodeId,
+        'warn',
+        `[分镜#${sb.number}] 参考图超限，道具「${alloc.droppedProps.join('、')}」未注入外观参考`,
       );
     }
 
-    const firstPrompt = this.prompt.storyboardImagePrompt(ctx, style);
-    const first = await this.image({
-      episodeId: sb.episodeId,
-      dramaId: sb.episode.dramaId,
-      label: `[分镜#${sb.number}] 首帧`,
-      prompt: firstPrompt,
-      filename: `sb-${sb.number}-first-${Date.now()}.png`,
-      ratio: '9:16',
-      images: references.length > 0 ? references.slice(0, 5) : undefined,
-    });
+    // 仅在需要重画首帧时才注入参考图并调用生图；
+    // 补尾帧场景下复用已有首帧，避免把已经稳定的人物形象重画一遍。
+    const reuseFirst = Boolean(sb.imageUrl) && !opts.force;
+    const firstPrompt = reuseFirst
+      ? sb.imagePrompt
+      : this.prompt.storyboardImagePrompt(ctx, style);
+    let first: StoredAsset | null = null;
+    if (reuseFirst) {
+      this.log(
+        sb.episodeId,
+        'info',
+        `[分镜#${sb.number}] 复用已有首帧，仅补生成尾帧`,
+      );
+    } else {
+      // VLM 自动质检：生成后立刻比对角色立绘参考图，不合格则换措辞重试。
+      // 复用已有的图片理解能力（文本模型），无额外供应商成本；
+      // 代价是每镜多一次模型调用（约 10~30s），且仅在真正重画首帧时发生。
+      const expectChars = charList.map((c: any) => ({
+        name: String(c?.name ?? ''),
+        anchor: c?.anchors ?? c?.appearance ?? null,
+      }));
+      // 仅取角色立绘参考（用于与待检首帧做身份比对，排除场景/道具/尾帧）
+      const charRefUris = references.filter((_, i) => ctx.refs[i]?.kind === 'character');
+      const refImages = references.length > 0 ? references : undefined;
 
-    const data: any = { imagePrompt: firstPrompt };
+      let attemptPrompt = firstPrompt ?? '';
+      for (let attempt = 1; attempt <= AUDIT_MAX_ATTEMPT; attempt++) {
+        first = await this.image({
+          episodeId: sb.episodeId,
+          dramaId: sb.episode.dramaId,
+          label: `[分镜#${sb.number}] 首帧`,
+          prompt: attemptPrompt,
+          filename: `sb-${sb.number}-first-${Date.now()}.png`,
+          ratio: '9:16',
+          images: refImages,
+        });
+        if (!first?.abs) break;
+
+        const frameUri = await this.storage.toDataUri(first.abs);
+        const audit = await this.prompt.auditFirstFrame(
+          charRefUris,
+          frameUri ?? '',
+          expectChars,
+        );
+        if (audit.pass) {
+          if (attempt > 1) {
+            this.log(
+              sb.episodeId,
+              'success',
+              `[分镜#${sb.number}] 首帧自动质检通过（第 ${attempt} 次生成）`,
+            );
+          }
+          break;
+        }
+
+        const last = attempt >= AUDIT_MAX_ATTEMPT;
+        this.log(
+          sb.episodeId,
+          'warn',
+          `[分镜#${sb.number}] 首帧自动质检未通过：${audit.issues.join('；')}（${
+            last ? '已达重试上限，保留本次结果' : '换措辞重试'
+          }）`,
+        );
+        if (last) break;
+
+        // 不合格产物直接丢弃（尚未落库，删掉即可，避免堆积孤儿文件），
+        // 并把质检结论追加进提示词，抬高模型遵守人物/服装锁定的概率。
+        await this.storage.removeLocalFiles([first.url]);
+        first = null;
+        attemptPrompt = `${firstPrompt ?? ''}，${audit.issues.join('；')}，务必严格遵守上述人物形象与服装锁定，不得出现上述问题`;
+      }
+    }
+
+    const data: any = firstPrompt ? { imagePrompt: firstPrompt } : {};
     if (first) {
       data.imageUrl = first.url;
       data.sourceUrl = first.remote ?? null;
     }
-    await this.prisma.storyboard.update({ where: { id: sb.id }, data });
+    if (Object.keys(data).length > 0) {
+      await this.prisma.storyboard.update({ where: { id: sb.id }, data });
+    }
     if (first && oldFirst && oldFirst !== first.url) {
       await this.storage.removeLocalFiles([oldFirst]);
     }
     this.logBus.emit(sb.episodeId, {
       type: 'storyboard',
-      data: { id: sb.id, status: 'pending', imageUrl: data.imageUrl ?? null, lastFrameUrl: sb.lastFrameUrl },
+      data: { id: sb.id, status: 'pending', imageUrl: data.imageUrl ?? sb.imageUrl, lastFrameUrl: sb.lastFrameUrl },
     });
 
-    // 尾帧：以首帧为参考做图生图，保证同场景同人物
+    // 尾帧：仅当本镜确有动作时才生成，且以首帧为参考做图生图，保证同场景同人物
+    const currentFirstAbs = this.absOf(data.imageUrl ?? sb.imageUrl);
     const firstRef =
-      first?.remote || (first?.abs ? await this.storage.toDataUri(first.abs) : null);
+      first?.remote ||
+      (first?.abs ? await this.storage.toDataUri(first.abs) : null) ||
+      (currentFirstAbs ? await this.storage.toDataUri(currentFirstAbs) : null) ||
+      null;
+    if (!needTail) {
+      this.log(
+        sb.episodeId,
+        'info',
+        `[分镜#${sb.number}] 静态镜/空镜，无需尾帧（跳过生图）`,
+      );
+      this.log(sb.episodeId, 'success', `[分镜#${sb.number}] 参考图生成完成`);
+      return;
+    }
     if (firstRef) {
       const tail = await this.image({
         episodeId: sb.episodeId,
@@ -645,6 +918,136 @@ export class GenerateService {
 
     // 尾帧衔接：提取视频真实尾帧，作为下一镜的画面参考
     await this.linkTailFrame(sb, asset.abs);
+  }
+
+  // ==================== 分镜配音（TTS） ====================
+
+  /**
+   * 生成本镜对白配音音轨。
+   *
+   * 【为何此前是死代码】工厂注册了 VolcengineProvider / EdgeTtsProvider 两个 TTS provider，
+   * 但全代码库从未调用过 `resolve('tts')`，`Storyboard.audioUrl` 只在读取侧出现、
+   * 从未被写入 —— 合成时永远走「保留 AI 原声」，用户配置的方言配音完全不生效。
+   * 现补齐写入侧：真实生成 → 落盘 → 写 audioUrl → 合成阶段混入。
+   */
+  async generateStoryboardAudio(storyboardId: number, opts: { force?: boolean } = {}) {
+    const sb = await this.loadStoryboard(storyboardId);
+    if (this.dubRunning.has(sb.id)) {
+      throw new ForbiddenException('该分镜正在配音中');
+    }
+    if (sb.audioUrl && !opts.force) {
+      this.log(sb.episodeId, 'info', `[分镜#${sb.number}] 配音已存在，跳过`);
+      return { started: false, episodeId: sb.episodeId, reason: 'already_generated' };
+    }
+    this.fire(sb.episodeId, 'asset', () => this.runStoryboardAudio(sb));
+    return { started: true, episodeId: sb.episodeId, storyboardId: sb.id };
+  }
+
+  /** 批量生成本集全部需要对白的分镜配音 */
+  async generateEpisodeAudio(episodeId: number) {
+    if (this.dubRunningEpisode.has(episodeId)) {
+      throw new ForbiddenException('该分集正在配音中');
+    }
+    const list = await this.prisma.storyboard.findMany({
+      where: { episodeId, deletedAt: null },
+      orderBy: { number: 'asc' },
+      select: { id: true, number: true, dialogue: true, audioUrl: true },
+    });
+    const todo = list.filter((s) => (s.dialogue ?? '').trim() && !s.audioUrl);
+    if (todo.length === 0) {
+      return { started: false, episodeId, reason: 'nothing_to_do' };
+    }
+    this.dubRunningEpisode.add(episodeId);
+    this.fire(episodeId, 'episode', async () => {
+      try {
+        for (const item of todo) {
+          try {
+            const sb = await this.loadStoryboard(item.id);
+            await this.runStoryboardAudio(sb);
+          } catch (e: any) {
+            this.log(episodeId, 'error', `[分镜#${item.number}] 配音失败：${e.message}`);
+          }
+        }
+        this.log(episodeId, 'success', `🎙️ 本集配音完成（${todo.length} 个分镜）`);
+      } finally {
+        this.dubRunningEpisode.delete(episodeId);
+      }
+    });
+    return { started: true, episodeId, count: todo.length };
+  }
+
+  /** 真实执行配音：对白 → TTS → 落盘 → 写 audioUrl */
+  async runStoryboardAudio(sb: LoadedStoryboard) {
+    const text = (sb.dialogue ?? '').trim();
+    if (!text) {
+      this.log(sb.episodeId, 'info', `[分镜#${sb.number}] 无对白，跳过配音`);
+      return;
+    }
+    this.dubRunning.add(sb.id);
+    try {
+      const dialect = this.resolveDialectKey({
+        dialect: sb.dialect,
+        character: sb.characters?.find((c: any) => c?.id === sb.characterIds[0]) ?? sb.character,
+        dramaDialect: sb.episode?.drama?.dialect,
+      });
+      const label = `[分镜#${sb.number}] 配音`;
+
+      if (!this.factory.isLive('tts')) {
+        this.log(
+          sb.episodeId,
+          'warn',
+          `${label}：无可用 TTS Provider，跳过（分镜将保留 AI 视频原声）`,
+        );
+        return;
+      }
+
+      const provider = this.factory.resolve('tts');
+      const res = await this.rate.withRetry(
+        label,
+        () =>
+          provider.generate('tts', {
+            prompt: text,
+            options: { dialect },
+          }),
+        (attempt, delay, reason) =>
+          this.log(
+            sb.episodeId,
+            'warn',
+            `${label}：重试 ${attempt} 次（${reason}），${Math.round(delay / 1000)}s 后继续`,
+          ),
+      );
+
+      const asset = await this.storage.saveAudio(
+        sb.episode.dramaId,
+        sb.episodeId,
+        `sb-${sb.number}-dub-${Date.now()}.mp3`,
+        { url: res.url, b64: res.b64 },
+      );
+      if (!asset.url) {
+        this.log(sb.episodeId, 'warn', `${label}：音频落盘失败`);
+        return;
+      }
+
+      const old = sb.audioUrl;
+      await this.prisma.storyboard.update({
+        where: { id: sb.id },
+        data: { audioUrl: asset.url },
+      });
+      if (old && old !== asset.url) {
+        await this.storage.removeLocalFiles([old]);
+      }
+      this.logBus.emit(sb.episodeId, {
+        type: 'storyboard',
+        data: { id: sb.id, audioUrl: asset.url },
+      });
+      this.log(
+        sb.episodeId,
+        'success',
+        `${label} 完成（${DIALECT_LABEL[dialect] ?? '标准普通话'} · ${provider.name}）`,
+      );
+    } finally {
+      this.dubRunning.delete(sb.id);
+    }
   }
 
   private async pollVideo(
@@ -1465,16 +1868,6 @@ export class GenerateService {
 
   /** 剧本拆解任务锁（按分集） */
   private parseRunning = new Set<number>();
-
-  private static readonly EMOTIONS = [
-    'neutral',
-    'happy',
-    'sad',
-    'angry',
-    'fear',
-    'surprise',
-  ] as const;
-
   /**
    * AI 拆解剧本：读取分集的 scriptText，由文本模型拆解出角色 / 场景 / 道具 / 分镜
    * 文本记录并落库（后台执行 + SSE 日志）。mode=replace 时先硬删除本集已有的
@@ -1528,7 +1921,7 @@ export class GenerateService {
     });
     if (!episode) throw new NotFoundException(`分集 ${episodeId} 不存在`);
     const mode = body?.mode === 'replace' ? 'replace' : 'append';
-    const parsed = this.normalizeParsedScript(body?.parsed);
+    const parsed = normalizeParsedScript(body?.parsed);
     if (!parsed.storyboards.length) {
       throw new BadRequestException('拆解结果中没有任何分镜，无法落库');
     }
@@ -1575,11 +1968,45 @@ export class GenerateService {
     dramaId: number;
     drama: { id: number; title: string; dialect: string | null };
   }): Promise<ParsedScript> {
+    const script = (episode.scriptText || '').trim();
+    const chunks = splitScriptChunks(script);
+    if (chunks.length > 1) {
+      this.log(
+        episode.id,
+        'info',
+        `📚 剧本较长（${script.length} 字），已自动切分为 ${chunks.length} 段分批拆解，避免模型输出被截断`,
+      );
+    }
     this.log(
       episode.id,
       'info',
-      '🤖 正在调用文本模型拆解剧本，请稍候（约 10~60 秒）...',
+      `🤖 正在调用文本模型拆解剧本，请稍候（约 10~60 秒${chunks.length > 1 ? ' × ' + chunks.length + ' 段' : ''}）...`,
     );
+    const parts: ParsedScript[] = [];
+    for (let i = 0; i < chunks.length; i += 1) {
+      if (chunks.length > 1) {
+        this.log(episode.id, 'info', `🤖 正在拆解第 ${i + 1}/${chunks.length} 段剧本...`);
+      }
+      parts.push(
+        await this.requestParseScriptChunk(episode, chunks[i], i + 1, chunks.length),
+      );
+    }
+    return mergeParsed(parts);
+  }
+
+  /** 单段剧本 → 文本模型 → 规范化结构 */
+  private async requestParseScriptChunk(
+    episode: {
+      id: number;
+      title: string;
+      description: string | null;
+      dramaId: number;
+      drama: { id: number; title: string; dialect: string | null };
+    },
+    scriptChunk: string,
+    chunkIndex: number,
+    chunkTotal: number,
+  ): Promise<ParsedScript> {
     const prompt = [
       '你是资深短剧分镜师。请阅读下面的漫剧剧本，把它拆解为可直接投产的结构化数据。',
       '',
@@ -1588,6 +2015,9 @@ export class GenerateService {
       episode.drama.dialect ? `剧集方言：${episode.drama.dialect}` : '',
       `分集标题：${episode.title}`,
       episode.description ? `分集简介：${episode.description}` : '',
+      chunkTotal > 1
+        ? `注意：这是完整剧本的第 ${chunkIndex}/${chunkTotal} 段，只拆解本段内容，不要补写前后段落的情节。`
+        : '',
       '',
       '输出要求（务必遵守）：',
       '1. 只输出一个 JSON 对象，不要任何解释、Markdown 代码块标记或多余文字。',
@@ -1599,9 +2029,12 @@ export class GenerateService {
       '3. 分镜须完整覆盖剧本情节并按叙事顺序排列；每镜时长为 4~12 的整数秒。',
       '4. 每个分镜的 characters 必须列出「本镜画面中出现」的全部角色（说话者与同框在场的角色都要列出，按主次排序），只能填上方 characters 列表中的角色名，禁止填入兵马俑、群众、雕像、动物等非角色实体。判定规则：①双人对话场景默认两个角色同框（说话者为第一主体，另一角色作为听众/反应角色也必须列入）；②动作描述中被互动的对方必须列入（如「老爸拉住蛋蛋」中老爸和蛋蛋都在画面里，两个都要列出）；③除非剧本明确写了切换到单人特写，否则同场景内先前在场且未离场的角色保持列入。对白直接写台词本身，不要带「角色名：」前缀；对白只写本镜主要说话角色的台词，对方的回话放到下一镜（保持一镜一说话人，便于配音）。无角色（纯空镜/旁白镜）用空数组 []。',
       '5. 角色只收录有台词或关键动作的角色；场景、道具只收录需要出图的关键项，不要凑数。',
+      '6. 角色跨镜头必须可辨认：appearance 里必须写明服装的颜色与款式（如「蓝色马甲、白衬衫」）与标志性配饰，这些是角色在全剧的身份标识，不得省略。同名同地点的条目只输出一条。',
+      '7. sceneDescription 必须写清景别（远景/全景/中景/近景/特写）与机位角度（平视/俯拍/仰拍），不要只写情绪；motionDescription 必须是具体可见的动作或镜头运动（如「镜头缓慢推近」「角色转身走向门口」），不要写「气氛紧张」这类不可拍摄的抽象描述。',
+      '8. 相邻分镜不要用完全相同的景别与构图，按「远—中—近」交替推进，保证节奏与画面变化。',
       '',
       '剧本原文：',
-      (episode.scriptText || '').trim(),
+      scriptChunk,
     ]
       .filter((l) => l !== '')
       .join('\n');
@@ -1611,75 +2044,8 @@ export class GenerateService {
       prompt,
       options: { temperature: 0.4, maxTokens: 8000 },
     });
-    return this.normalizeParsedScript(this.extractJsonObject(res.text || ''));
+    return normalizeParsedScript(extractJsonObject(res.text || ''));
   }
-
-  /** 规范化拆解结构：剔除空名条目、丢弃全空分镜、夹取取值范围 */
-  private normalizeParsedScript(raw: any): ParsedScript {
-    const src = raw && typeof raw === 'object' ? raw : {};
-    const arr = (v: any) => (Array.isArray(v) ? v : []);
-    const characters = arr(src.characters)
-      .map((c: any) => ({
-        name: this.normStr(c?.name) ?? '',
-        role: this.normStr(c?.role),
-        roleLabel: this.normStr(c?.roleLabel),
-        appearance: this.normStr(c?.appearance),
-        intro: this.normStr(c?.intro),
-      }))
-      .filter((c: any) => c.name);
-    // 已知角色名集合：用于剥离对白里的「角色名：」前缀（模型偶发带出）
-    const charNameSet = new Set(
-      characters.map((c: any) => c.name as string),
-    );
-    const stripSpeakerPrefix = (text: string | null): string | null => {
-      if (!text) return text;
-      const m = text.match(/^([^：:]{1,12})[：:]\s*(.+)$/s);
-      if (m && charNameSet.has(m[1].trim())) return m[2].trim();
-      return text;
-    };
-    const scenes = arr(src.scenes)
-      .map((s: any) => ({
-        location: this.normStr(s?.location) ?? '',
-        time: this.normStr(s?.time),
-        description: this.normStr(s?.description),
-      }))
-      .filter((s: any) => s.location);
-    const props = arr(src.props)
-      .map((p: any) => ({
-        name: this.normStr(p?.name) ?? '',
-        type: this.normStr(p?.type),
-        description: this.normStr(p?.description),
-      }))
-      .filter((p: any) => p.name);
-    const storyboards = arr(src.storyboards)
-      .map((sb: any) => {
-        // 多角色：characters 数组（新格式），回退单值 character（旧格式/手工数据）
-        let names: string[] = arr(sb?.characters)
-          .map((n: any) => this.normStr(n))
-          .filter((n: string | null): n is string => Boolean(n));
-        const single = this.normStr(sb?.character);
-        if (names.length === 0 && single) names = [single];
-        names = [...new Set(names)];
-        return {
-          characters: names,
-          character: names[0] ?? null,
-          scene: this.normStr(sb?.scene),
-          prop: this.normStr(sb?.prop),
-          dialogue: stripSpeakerPrefix(this.normStr(sb?.dialogue)),
-          narration: this.normStr(sb?.narration),
-          sceneDescription: this.normStr(sb?.sceneDescription),
-          motionDescription: this.normStr(sb?.motionDescription),
-          emotion: this.normEmotion(sb?.emotion),
-          duration: this.normDuration(sb?.duration),
-        };
-      })
-      .filter(
-        (sb: any) =>
-          sb.dialogue || sb.narration || sb.sceneDescription || sb.motionDescription,
-      );
-    return { characters, scenes, props, storyboards };
-  }
-
   /** 落库：替换清空（可选）→ 角色按姓名去重复用 → 场景/道具 → 分镜 */
   private async applyParsed(
     episode: {
@@ -1732,16 +2098,19 @@ export class GenerateService {
     });
     const charMap = new Map<string, number>();
     for (const c of existChars) charMap.set(c.name.trim(), c.id);
+    // 角色名单变了，场景/道具提示词里用于「人名 vs 实物」消歧的上下文缓存必须失效
+    this.roleCtxCache.delete(episode.dramaId);
     let charCreated = 0;
+    const appearanceChanged: string[] = [];
     for (const c of characters) {
-      const name = this.normStr(c?.name);
+      const name = normStr(c?.name);
       if (!name) continue;
       const existId = charMap.get(name);
       if (existId) {
         const patch: any = {};
-        const roleLabel = this.normStr(c?.roleLabel);
-        const appearance = this.normStr(c?.appearance);
-        const intro = this.normStr(c?.intro);
+        const roleLabel = normStr(c?.roleLabel);
+        const appearance = normStr(c?.appearance);
+        const intro = normStr(c?.intro);
         if (roleLabel) patch.roleLabel = roleLabel;
         if (appearance) patch.appearance = appearance;
         if (intro) patch.intro = intro;
@@ -1751,16 +2120,29 @@ export class GenerateService {
             data: patch,
           });
         }
+        // 已出立绘的角色：文字外貌变了不会自动改图。
+        // 视觉锚点锚定的是「立绘实际形象」，若强行用新文字覆盖，
+        // 会造成「立绘是旧形象、锚点写新外貌」的分裂，比不改更糟。
+        // 这里只如实提示，让用户决定是否重出立绘。
+        const old = existChars.find((x) => x.id === existId);
+        if (
+          appearance &&
+          old?.appearance &&
+          normalizeNameKey(appearance) !== normalizeNameKey(old.appearance) &&
+          old?.imageUrl
+        ) {
+          appearanceChanged.push(name);
+        }
         continue;
       }
       const created = await this.prisma.character.create({
         data: {
           dramaId: episode.dramaId,
           name,
-          role: this.normStr(c?.role) || 'supporting',
-          roleLabel: this.normStr(c?.roleLabel),
-          appearance: this.normStr(c?.appearance),
-          intro: this.normStr(c?.intro),
+          role: normStr(c?.role) || 'supporting',
+          roleLabel: normStr(c?.roleLabel),
+          appearance: normStr(c?.appearance),
+          intro: normStr(c?.intro),
         },
       });
       charMap.set(name, created.id);
@@ -1771,35 +2153,64 @@ export class GenerateService {
       'success',
       `👤 角色就绪：新增 ${charCreated} 名，复用已有 ${characters.length - charCreated} 名`,
     );
+    if (appearanceChanged.length > 0) {
+      this.log(
+        episodeId,
+        'warn',
+        `⚠️ 以下角色的外貌文字已更新，但立绘图仍是旧形象：${appearanceChanged.join('、')}。` +
+          `视觉锚点以立绘为准，需在「角色」面板手动重出立绘后才能让新外貌生效`,
+      );
+    }
 
-    // ④ 场景 / 道具：直接创建（分集私有；同名场景允许跨集存在）
-    const sceneMap = new Map<string, number>();
+    // ④ 场景 / 道具：同一「地点 + 时间段」只建一条，避免同一地点重复出图、
+    // 也避免分镜引用到两个「看起来一样但 id 不同」的场景记录。
+    // append 模式下先载入本集已有记录并复用，防止重复追加。
+    const existScenes =
+      mode === 'append'
+        ? await this.prisma.scene.findMany({ where: { episodeId, deletedAt: null } })
+        : [];
+    const sceneByLocTime = new Map<string, number>();
+    for (const s of existScenes) {
+      sceneByLocTime.set(locTimeKey(s.location, s.time), s.id);
+    }
+    // sceneMap 供分镜按名称查 id（模糊匹配），初始化为已有场景的 location → id
+    const sceneMap = new Map<string, number>(
+      existScenes.map((s) => [s.location.trim(), s.id] as const),
+    );
     let sceneCreated = 0;
     for (const s of scenes) {
-      const location = this.normStr(s?.location);
+      const location = normStr(s?.location);
       if (!location) continue;
+      const time = normStr(s?.time);
+      const existingId = sceneByLocTime.get(locTimeKey(location, time));
+      if (existingId != null) {
+        sceneMap.set(location, existingId);
+        continue;
+      }
       const created = await this.prisma.scene.create({
-        data: {
-          episodeId,
-          location,
-          time: this.normStr(s?.time),
-          description: this.normStr(s?.description),
-        },
+        data: { episodeId, location, time, description: normStr(s?.description) },
       });
+      sceneByLocTime.set(locTimeKey(location, time), created.id);
       sceneMap.set(location, created.id);
       sceneCreated += 1;
     }
+    const existProps =
+      mode === 'append'
+        ? await this.prisma.prop.findMany({ where: { episodeId, deletedAt: null } })
+        : [];
     const propMap = new Map<string, number>();
+    for (const p of existProps) propMap.set(p.name.trim(), p.id);
     let propCreated = 0;
     for (const p of props) {
-      const name = this.normStr(p?.name);
+      const name = normStr(p?.name);
       if (!name) continue;
+      if (matchName(propMap, name) != null) continue;
       const created = await this.prisma.prop.create({
         data: {
           episodeId,
           name,
-          type: this.normStr(p?.type),
-          description: this.normStr(p?.description),
+          type: normStr(p?.type),
+          description: normStr(p?.description),
         },
       });
       propMap.set(name, created.id);
@@ -1815,43 +2226,65 @@ export class GenerateService {
     const unknownChars = new Set<string>();
     const unknownScenes = new Set<string>();
     const unknownProps = new Set<string>();
+
+    // append 模式必须从「已有分镜的最大编号 +1」继续，
+    // 否则会与已有分镜撞号（两个 number 相同的分镜，排序与 prevTailFrame 全部错乱）。
+    let numberCursor = 0;
+    if (mode === 'append') {
+      const maxRow = await this.prisma.storyboard.aggregate({
+        where: { episodeId, deletedAt: null },
+        _max: { number: true },
+      });
+      numberCursor = maxRow._max.number ?? 0;
+    }
+
     let sbCreated = 0;
     for (let i = 0; i < storyboards.length; i += 1) {
       const sb = storyboards[i];
       const hasText =
-        this.normStr(sb?.dialogue) ||
-        this.normStr(sb?.narration) ||
-        this.normStr(sb?.sceneDescription) ||
-        this.normStr(sb?.motionDescription);
+        normStr(sb?.dialogue) ||
+        normStr(sb?.narration) ||
+        normStr(sb?.sceneDescription) ||
+        normStr(sb?.motionDescription);
       if (!hasText) continue; // 全空的分镜直接丢弃
+
+      // 角色名模糊匹配：AI 返回的名字常带空格/称谓后缀（「蛋蛋 」「小蛋蛋」），
+      // 精确匹配失败会导致分镜挂不上角色 —— 这是「分镜很烂」最常见的一处空档。
       const sbCharNames: string[] = (sb?.characters || [])
-        .map((n: any) => this.normStr(n))
+        .map((n: any) => normStr(n))
         .filter((n: string | null): n is string => Boolean(n));
-      const sceneName = this.normStr(sb?.scene) ?? '';
-      const propName = this.normStr(sb?.prop) ?? '';
-      // 多角色：全部名称解析为 id（未匹配的进警告名单），第一个同时写单值 characterId 兼容
-      const charIds = sbCharNames
-        .map((n) => {
-          if (n && !charMap.has(n)) unknownChars.add(n);
-          return n ? charMap.get(n) : undefined;
-        })
-        .filter((v): v is number => v != null);
-      if (sceneName && !sceneMap.has(sceneName)) unknownScenes.add(sceneName);
-      if (propName && !propMap.has(propName)) unknownProps.add(propName);
+      const resolvedCharIds: number[] = [];
+      for (const n of sbCharNames) {
+        const hit = matchName(charMap, n);
+        if (hit != null) {
+          if (!resolvedCharIds.includes(hit)) resolvedCharIds.push(hit);
+        } else {
+          unknownChars.add(n);
+        }
+      }
+      const sceneName = normStr(sb?.scene) ?? '';
+      const propName = normStr(sb?.prop) ?? '';
+      const sceneId = sceneName ? matchName(sceneMap, sceneName) : null;
+      const propId = propName ? matchName(propMap, propName) : null;
+      if (sceneName && sceneId == null) unknownScenes.add(sceneName);
+      if (propName && propId == null) unknownProps.add(propName);
+
+      const dialogue = normStr(sb?.dialogue);
+      const narration = normStr(sb?.narration);
       await this.prisma.storyboard.create({
         data: {
           episodeId,
-          number: sbCreated + 1,
-          characterId: charIds[0] ?? null,
-          characterIds: charIds.length > 0 ? JSON.stringify(charIds) : null,
-          sceneId: sceneMap.get(sceneName) ?? null,
-          propId: propMap.get(propName) ?? null,
-          dialogue: this.normStr(sb?.dialogue),
-          narration: this.normStr(sb?.narration),
-          sceneDescription: this.normStr(sb?.sceneDescription),
-          motionDescription: this.normStr(sb?.motionDescription),
-          emotion: this.normEmotion(sb?.emotion),
-          duration: this.normDuration(sb?.duration),
+          number: numberCursor + sbCreated + 1,
+          characterId: resolvedCharIds[0] ?? null,
+          characterIds: resolvedCharIds.length > 0 ? JSON.stringify(resolvedCharIds) : null,
+          sceneId,
+          propId,
+          dialogue,
+          narration,
+          sceneDescription: normStr(sb?.sceneDescription),
+          motionDescription: normStr(sb?.motionDescription),
+          emotion: normEmotion(sb?.emotion),
+          duration: normDuration(sb?.duration, dialogue, narration),
           status: 'pending',
         },
       });
@@ -1885,40 +2318,6 @@ export class GenerateService {
     );
   }
 
-  /** 从 AI 返回文本中稳健提取 JSON 对象（容忍代码块包裹与前后杂讯） */
-  private extractJsonObject(raw: string): any {
-    let s = (raw || '').trim();
-    s = s.replace(/```(?:json)?/gi, '').trim();
-    const start = s.indexOf('{');
-    const end = s.lastIndexOf('}');
-    if (start < 0 || end <= start) {
-      throw new Error('AI 返回内容中未找到 JSON，请重试');
-    }
-    try {
-      return JSON.parse(s.slice(start, end + 1));
-    } catch {
-      throw new Error('AI 返回的 JSON 解析失败，请重试');
-    }
-  }
-
-  private normStr(v: any): string | null {
-    if (v === null || v === undefined) return null;
-    const s = String(v).trim();
-    return s || null;
-  }
-
-  private normEmotion(v: any): string {
-    const s = String(v ?? '').trim();
-    return (GenerateService.EMOTIONS as readonly string[]).includes(s)
-      ? s
-      : 'neutral';
-  }
-
-  private normDuration(v: any): number {
-    const n = Number(v);
-    if (!Number.isFinite(n)) return 5;
-    return Math.min(12, Math.max(4, Math.round(n)));
-  }
 
   private async runMerge(
     episode: { id: number; dramaId: number },
@@ -2001,7 +2400,10 @@ export class GenerateService {
         }
       }
 
-      const audioLocal = this.storage.absFromUrl(sb.audioUrl);
+      // 对白音轨：mergeCfg.burn_dialogue_audio 关闭时保留 AI 视频原声（此前该开关完全无效）
+      const audioLocal = cfg.burn_dialogue_audio === false
+        ? undefined
+        : this.storage.absFromUrl(sb.audioUrl);
       const seg = path.join(dir, `seg-${sb.number}.mp4`);
       const ok = await this.ffmpeg.normalizeSegment({
         video: videoLocal,
@@ -2224,12 +2626,13 @@ export class GenerateService {
     return this.absOf(rel);
   }
 
-  private absOf(uploadsPath: string) {
-    const root = path.resolve(
-      process.cwd(),
-      process.env.UPLOAD_DIR || '../data/uploads',
-    );
-    return path.join(root, uploadsPath.replace(/^\/uploads\//, ''));
+  /**
+   * /uploads/... 本地路径 → 磁盘绝对路径。
+   * 路径拼装与目录穿越护栏统一由 StorageService.absFromUrl() 提供，
+   * 此处仅作委托，避免两份实现漂移（曾因只改一处导致护栏失效）。
+   */
+  private absOf(uploadsPath?: string | null): string | null {
+    return this.storage.absFromUrl(uploadsPath);
   }
 
   /** 该剧角色名单（用于场景/道具生成的命名消歧，缓存避免并发重复查库） */

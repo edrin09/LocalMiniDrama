@@ -120,12 +120,25 @@ export class StorageService {
     return `/uploads/${dramaId}/${episodeId}/${name}`;
   }
 
-  /** 本地 /uploads/... 路径 → 磁盘绝对路径 */
+  /**
+   * 本地 /uploads/... 路径 → 磁盘绝对路径。
+   *
+   * 全项目唯一的路径拼装入口（generate.service.ts 曾另有一份 absOf()，
+   * 两份实现已开始漂移：一份带目录穿越护栏、一份没有）。
+   * 护栏只写在这里，避免「改一处忘另一处」导致路径解析行为不一致。
+   */
   absFromUrl(localUrl?: string | null): string | null {
     if (!localUrl) return null;
     if (/^https?:\/\//i.test(localUrl)) return null;
     if (!localUrl.startsWith('/uploads/')) return null;
-    return path.join(this.root, localUrl.replace(/^\/uploads\//, ''));
+    const root = path.resolve(this.root);
+    const abs = path.resolve(root, localUrl.replace(/^\/uploads\//, ''));
+    // 护栏：拼接结果必须仍在 uploads 根目录内，杜绝 ../ 穿越
+    if (!abs.startsWith(root + path.sep)) {
+      this.logger.warn(`拒绝解析越界路径（超出 uploads 根目录）：${localUrl}`);
+      return null;
+    }
+    return abs;
   }
 
   /** 成片输出位置（返回可访问 url 与绝对路径） */

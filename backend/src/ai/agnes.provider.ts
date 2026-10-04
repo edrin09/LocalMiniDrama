@@ -193,7 +193,6 @@ export class AgnesProvider implements AIProvider {
       firstFrame,
       lastFrame,
       images,
-      seed,
     } = (req.options ?? {}) as {
       mode?: 'text' | 'keyframe' | 'reference';
       seconds?: string;
@@ -202,7 +201,6 @@ export class AgnesProvider implements AIProvider {
       firstFrame?: string;
       lastFrame?: string;
       images?: string[];
-      seed?: number;
     };
 
     const body: Record<string, any> = {
@@ -226,7 +224,8 @@ export class AgnesProvider implements AIProvider {
       // Flash 最多 5 张
       body.images = images.slice(0, 5);
     }
-    if (seed !== undefined) body.seed = seed;
+    // 注意：Agnes 生图与视频接口均不支持 seed 参数（官方参数表未列出），
+    // 因此不存在「传 seed 锁人物」这条路，角色一致性只能靠参考图 + 文字锚点。
 
     const data = await this.request(`${this.config.baseUrl}/videos`, {
       method: 'POST',

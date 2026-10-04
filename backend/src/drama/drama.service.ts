@@ -73,8 +73,8 @@ export class DramaService {
       coverStyle: dto.coverStyle ?? 'default',
       seed: dto.seed ?? this.randomSeed(),
     };
-    // 大标题去空格用于物理目录名
-    data.title = data.title;
+    // 说明：物理目录用 dramaId（见 ensureUploadDir），标题与目录名无关，此处无需再处理。
+    // （此前存在 `data.title = data.title;` 自赋值，注释与实现均不符，已删除）
     const drama = await this.prisma.drama.create({ data });
     await this.ensureUploadDir(drama);
     return drama;
