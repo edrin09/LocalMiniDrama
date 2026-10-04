@@ -321,7 +321,9 @@ export class ScriptService {
   async listStoryboards(episodeId?: number) {
     const rows = await this.prisma.storyboard.findMany({
       where: { deletedAt: null, ...(episodeId ? { episodeId } : {}) },
-      orderBy: { number: 'asc' },
+      // 排序必须带二级键 id：编号重复或存在空洞时，数据库返回顺序不确定，
+      // 前端每次刷新看到的分镜顺序可能不同（曾导致「保存后镜头自己动了」）。
+      orderBy: [{ number: 'asc' }, { id: 'asc' }],
       include: {
         character: { select: { id: true, name: true, roleLabel: true } },
         scene: { select: { id: true, location: true, time: true } },
@@ -417,15 +419,32 @@ export class ScriptService {
     if (!Array.isArray(ids) || ids.length === 0) {
       throw new BadRequestException('ids 不能为空');
     }
+    const unique = [...new Set(ids.filter((v) => Number.isInteger(v)))];
+    if (unique.length !== ids.length) {
+      throw new BadRequestException('ids 中存在重复项');
+    }
+    // 校验所有 id 确实属于本分集：否则会把别的分集的分镜编号改掉，
+    // 且本分集编号出现空洞，镜头顺序与尾帧衔接全部错乱。
+    const owned = await this.prisma.storyboard.findMany({
+      where: { episodeId, deletedAt: null, id: { in: unique } },
+      select: { id: true },
+    });
+    const ownedIds = new Set(owned.map((r) => r.id));
+    const foreign = unique.filter((v) => !ownedIds.has(v));
+    if (foreign.length > 0) {
+      throw new BadRequestException(
+        `分镜 ${foreign.join('、')} 不属于本分集，无法重排`,
+      );
+    }
     await this.prisma.$transaction(
-      ids.map((sid, idx) =>
+      unique.map((sid, idx) =>
         this.prisma.storyboard.update({
           where: { id: sid },
           data: { number: idx + 1 },
         }),
       ),
     );
-    return { episodeId, reordered: ids.length };
+    return { episodeId, reordered: unique.length };
   }
 
   async deleteStoryboard(id: number) {
