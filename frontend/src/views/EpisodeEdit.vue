@@ -20,6 +20,10 @@ import {
   Goods,
   Film,
   ArrowDown,
+  WarningFilled,
+  Timer,
+  Microphone,
+  Bell,
 } from '@element-plus/icons-vue';
 import {
   episodeApi,
@@ -33,6 +37,7 @@ import {
   aiApi,
 } from '@/api';
 import { DIALECT_MAP } from '@/utils/dialect';
+import { sbIssues, speechSeconds, type SbIssue } from '@/composables/useSbHealth';
 import type {
   Episode,
   Character,
@@ -177,6 +182,41 @@ async function genSbVideo(force = false) {
     await generateApi.generateStoryboardVideo(sb.id, force);
   } catch (e: any) {
     assetBusy.value['sb-video'] = false;
+    ElMessage.error(e.message);
+  }
+}
+
+/** 生成对本镜对白的配音（合成时混入，替换 AI 视频不可控的原声） */
+async function genSbAudio(force = false) {
+  const sb = selectedStoryboard.value;
+  if (!sb || assetBusy.value['sb-audio']) return;
+  if (!(sb.dialogue ?? '').trim()) {
+    ElMessage.warning('本镜没有对白，无需配音');
+    return;
+  }
+  assetBusy.value['sb-audio'] = true;
+  addLog('info', `[分镜#${sb.number}] 配音生成中（${resolveDialect(sb).label}）...`);
+  try {
+    await generateApi.generateStoryboardAudio(sb.id, force);
+  } catch (e: any) {
+    assetBusy.value['sb-audio'] = false;
+    ElMessage.error(e.message);
+  }
+}
+
+/** 为整集全部有对白、且尚未配音的分镜批量配音 */
+async function genEpisodeAudio() {
+  if (assetBusy.value['ep-audio']) return;
+  assetBusy.value['ep-audio'] = true;
+  addLog('info', '批量配音中...');
+  try {
+    const res: any = await generateApi.generateEpisodeAudio(episodeId);
+    if (!res?.started) {
+      assetBusy.value['ep-audio'] = false;
+      ElMessage.info(res?.reason === 'nothing_to_do' ? '所有对白均已配音' : '无需配音');
+    }
+  } catch (e: any) {
+    assetBusy.value['ep-audio'] = false;
     ElMessage.error(e.message);
   }
 }
@@ -930,6 +970,76 @@ function totalDuration() {
   return storyboards.value.reduce((s, x) => s + (x.duration ?? 0), 0).toFixed(1);
 }
 
+/* ================= 分镜体检 =================
+ * 规则实现已抽离到 composables/useSbHealth.ts（纯函数 + 注入式资产查找，可单测）。
+ * 这里只负责把分集资产喂进去并汇总结果。
+ */
+/** 全集体检问题汇总（按镜头顺序）；规则实现见 composables/useSbHealth.ts */
+const issuePanelOpen = ref(false);
+const sbIssueMap = computed(() => {
+  const m = new Map<number, SbIssue[]>();
+  for (const sb of storyboards.value) {
+    const list = sbIssues(sb, { charsOf, propsOf, sceneOf });
+    if (list.length) m.set(sb.id, list);
+  }
+  return m;
+});
+const sbIssueCount = computed(() => {
+  let n = 0;
+  for (const list of sbIssueMap.value.values()) n += list.length;
+  return n;
+});
+
+/** 单镜：自动按台词把时长补到刚好念完 */
+async function autoFitDuration(sb: Storyboard) {
+  const need = speechSeconds(`${sb.dialogue || ''}${sb.narration || ''}`);
+  if (!need) {
+    ElMessage.info('本镜没有台词/旁白，无需按台词调整时长');
+    return;
+  }
+  const next = Math.min(12, Math.max(4, Math.ceil(need)));
+  if (next === sb.duration) {
+    ElMessage.success(`本镜时长 ${next}s 已能念完台词`);
+    return;
+  }
+  try {
+    const updated = await storyboardApi.update(sb.id, { duration: next });
+    applyStoryboardUpdate(updated);
+    ElMessage.success(`分镜 #${sb.number} 时长已调整为 ${next}s（按台词长度）`);
+  } catch (e: any) {
+    ElMessage.error(e.message || '调整失败');
+  }
+}
+
+/** 全集：批量按台词长度校准时长 */
+async function autoFitAllDurations() {
+  const targets = storyboards.value
+    .map((sb) => {
+      const need = speechSeconds(`${sb.dialogue || ''}${sb.narration || ''}`);
+      if (!need) return null;
+      const next = Math.min(12, Math.max(4, Math.ceil(need)));
+      return next === sb.duration ? null : { sb, next };
+    })
+    .filter(Boolean) as { sb: Storyboard; next: number }[];
+  if (!targets.length) {
+    ElMessage.success('全部分镜时长已与台词匹配，无需调整');
+    return;
+  }
+  const failed: string[] = [];
+  for (const { sb, next } of targets) {
+    try {
+      applyStoryboardUpdate(await storyboardApi.update(sb.id, { duration: next }));
+    } catch {
+      failed.push(`#${sb.number}`);
+    }
+  }
+  if (failed.length) {
+    ElMessage.warning(`已调整 ${targets.length - failed.length} 个分镜，失败：${failed.join('、')}`);
+  } else {
+    ElMessage.success(`已按台词长度校准 ${targets.length} 个分镜时长`);
+  }
+}
+
 /** 分镜缩略图：优先首帧图，回退尾帧 */
 function sbThumb(sb: Storyboard): string {
   return sb.imageUrl || sb.lastFrameUrl || '';
@@ -1664,7 +1774,7 @@ onBeforeUnmount(() => {
               </div>
               <div class="res-body">
                 <div class="res-name">{{ s.location }} <el-tag v-if="s.time" size="small" effect="plain">{{ s.time }}</el-tag>
-                  <el-tag v-if="s.useQuadGrid" size="small" type="warning" effect="plain">四宫格</el-tag>
+                  
                 </div>
                 <div class="res-meta">关联分镜：{{ usedBy('scenes', s.id) }}</div>
                 <div class="res-meta">{{ s.description ? s.description.slice(0, 40) : '暂无场景描述' }}</div>
@@ -1701,7 +1811,7 @@ onBeforeUnmount(() => {
               </div>
               <div class="res-body">
                 <div class="res-name">{{ p.name }} <el-tag v-if="p.type" size="small" effect="plain">{{ p.type }}</el-tag>
-                  <el-tag v-if="p.useQuadGrid" size="small" type="warning" effect="plain">四视图</el-tag>
+                  
                 </div>
                 <div class="res-meta">关联分镜：{{ usedBy('props', p.id) }}</div>
                 <div class="res-meta">{{ p.description ? p.description.slice(0, 40) : '无描述' }}</div>
@@ -1730,10 +1840,38 @@ onBeforeUnmount(() => {
           <div class="sb-list-head">
             <span class="panel-title" style="margin:0">分镜列表</span>
             <span class="muted">{{ totalDuration() }}s</span>
+            <button
+              v-if="sbIssueCount > 0"
+              class="lmd-btn-ghost sm warn"
+              :title="`共 ${sbIssueCount} 处问题，点击查看`"
+              @click="issuePanelOpen = !issuePanelOpen"
+            >
+              <el-icon :size="13"><WarningFilled /></el-icon>{{ sbIssueCount }} 处问题
+            </button>
+            <button class="lmd-btn-ghost sm" title="按台词实际长度批量校准所有分镜时长（避免配音被截断）" @click="autoFitAllDurations">
+              <el-icon :size="13"><Timer /></el-icon>校准时长
+            </button>
             <button class="lmd-btn-ghost sm" :disabled="regenSbRunning || generating" title="按当前剧本强制重做全部分镜的首尾帧与视频（统一人物风格/音轨语言）" @click="regenerateStoryboards">
               <span v-if="regenSbRunning" class="mini-spinner dark" />
               <el-icon v-else :size="13"><RefreshRight /></el-icon>{{ regenSbRunning ? '重新生成中...' : '重新生成素材' }}
             </button>
+          </div>
+          <!-- 分镜体检面板：把注定出问题的点提前暴露，而不是等出片后才发现 -->
+          <div v-if="issuePanelOpen && sbIssueCount > 0" class="sb-issue-panel">
+            <div v-for="sb in storyboards.filter((s) => sbIssueMap.has(s.id))" :key="sb.id" class="sb-issue-row">
+              <span class="sb-issue-num">#{{ sb.number }}</span>
+              <div class="sb-issue-list">
+                <div
+                  v-for="(it, k) in sbIssueMap.get(sb.id)"
+                  :key="k"
+                  class="sb-issue-item"
+                  :class="it.level"
+                  @click="selectStoryboard(storyboards.findIndex((s) => s.id === sb.id))"
+                >
+                  <el-icon :size="12"><WarningFilled /></el-icon>{{ it.text }}
+                </div>
+              </div>
+            </div>
           </div>
           <div class="sb-list-body">
             <div
@@ -1759,6 +1897,15 @@ onBeforeUnmount(() => {
                   <span class="sb-num">#{{ sb.number }}</span>
                   <span class="sb-dur">{{ sb.duration }}s</span>
                   <span v-if="sbHasVideo(sb)" class="sb-bar-video"><el-icon :size="11"><VideoPlay /></el-icon></span>
+                  <span
+                    v-if="sbIssueMap.get(sb.id)?.length"
+                    class="sb-warn-dot"
+                    :class="{ error: sbIssueMap.get(sb.id)!.some((x) => x.level === 'error') }"
+                    :title="sbIssueMap.get(sb.id)!.map((x) => x.text).join('\n')"
+                    @click.stop
+                  >
+                    <el-icon :size="11"><WarningFilled /></el-icon>
+                  </span>
                   <span class="badge" :class="statusMeta(sb.status).cls">{{ statusMeta(sb.status).text }}</span>
                 </div>
                 <div class="sb-item-desc">
@@ -1873,9 +2020,35 @@ onBeforeUnmount(() => {
                     </el-select>
                   </el-form-item>
                   <el-form-item label="时长（秒）">
-                    <el-input-number v-model="sbForm.duration" :min="1" :max="30" :step="0.5" style="width:100%" />
+                    <div style="display:flex;gap:8px;align-items:center;width:100%">
+                      <el-input-number v-model="sbForm.duration" :min="1" :max="30" :step="0.5" style="flex:1" />
+                      <button
+                        class="lmd-btn-ghost sm"
+                        type="button"
+                        :disabled="!speechSeconds(`${sbForm.dialogue}${sbForm.narration}`)"
+                        :title="speechSeconds(`${sbForm.dialogue}${sbForm.narration}`) ? `台词约需 ${speechSeconds(`${sbForm.dialogue}${sbForm.narration}`)}s，自动对齐` : '本镜无台词，无需对齐'"
+                        @click="autoFitDuration(selectedStoryboard)"
+                      >
+                        <el-icon :size="12"><Timer /></el-icon>对齐台词
+                      </button>
+                    </div>
                   </el-form-item>
                 </el-form>
+
+                <!-- 本镜体检结果：定位到「哪一镜的哪一处有问题」 -->
+                <div
+                  v-if="selectedStoryboard && sbIssueMap.get(selectedStoryboard.id)?.length"
+                  class="sb-issue-panel inline"
+                >
+                  <div
+                    v-for="(it, k) in sbIssueMap.get(selectedStoryboard.id)"
+                    :key="k"
+                    class="sb-issue-item"
+                    :class="it.level"
+                  >
+                    <el-icon :size="12"><WarningFilled /></el-icon>{{ it.text }}
+                  </div>
+                </div>
 
                 <div class="sb-assoc-panel">
                   <div class="sb-assoc-head">
@@ -2142,6 +2315,24 @@ onBeforeUnmount(() => {
               <button class="lmd-btn-ghost" :disabled="!!assetBusy['sb-video']" @click="genSbVideo(true)">
                 <span v-if="assetBusy['sb-video']" class="mini-spinner dark" />
                 <el-icon v-else class="mr-1" :size="14"><RefreshRight /></el-icon>重新生成视频
+              </button>
+              <button
+                class="lmd-btn-ghost"
+                :disabled="!!assetBusy['sb-audio'] || !(selectedStoryboard.dialogue ?? '').trim()"
+                :title="selectedStoryboard.audioUrl ? '重新生成本镜配音' : '生成对白配音（合成时混入，替换 AI 原声）'"
+                @click="genSbAudio(!!selectedStoryboard.audioUrl)"
+              >
+                <span v-if="assetBusy['sb-audio']" class="mini-spinner dark" />
+                <el-icon v-else class="mr-1" :size="14"><Microphone /></el-icon>{{ selectedStoryboard.audioUrl ? '重新配音' : '生成配音' }}
+              </button>
+              <button
+                class="lmd-btn-ghost"
+                :disabled="!!assetBusy['ep-audio']"
+                title="为本集所有有对白且尚未配音的分镜批量生成配音"
+                @click="genEpisodeAudio"
+              >
+                <span v-if="assetBusy['ep-audio']" class="mini-spinner dark" />
+                <el-icon v-else class="mr-1" :size="14"><Bell /></el-icon>批量配音
               </button>
             </div>
           </div>
@@ -2422,8 +2613,8 @@ onBeforeUnmount(() => {
           <el-input v-model="sceneForm.prompt" type="textarea" :rows="2" placeholder="供生成场景参考图的提示词；可留空由 AI 生成" />
         </el-form-item>
         <el-form-item label="生成模式">
-          <el-switch v-model="sceneForm.useQuadGrid" active-text="四宫格（正/侧/俯/仰）" inactive-text="单图（默认）" />
-          <p class="form-hint">单图场景更适合直接作为分镜视频参考图；四宫格便于挑选机位。切换后需重新生成才会生效。</p>
+          <el-tag type="info" effect="plain">统一单图</el-tag>
+          <p class="form-hint">四宫格已停用：项目没有图像切割能力，拼图无法切分后单独使用，反而会污染分镜参考图。场景将统一生成单张完整场景图。</p>
         </el-form-item>
       </el-form>
       <el-form label-position="top" v-if="resDialog.kind === 'props'">
@@ -2486,8 +2677,8 @@ onBeforeUnmount(() => {
           <el-input v-model="propForm.prompt" type="textarea" :rows="2" placeholder="供生成道具参考图的提示词；可留空由 AI 生成" />
         </el-form-item>
         <el-form-item label="生成模式">
-          <el-switch v-model="propForm.useQuadGrid" active-text="四视图（正/侧/背/45°）" inactive-text="单图（默认）" />
-          <p class="form-hint">单图为纯色无缝背景；四视图便于保持多机位一致性。切换后需重新生成才会生效。</p>
+          <el-tag type="info" effect="plain">统一单图</el-tag>
+          <p class="form-hint">四视图已停用：项目没有图像切割能力，拼图无法切分后单独使用，反而会污染分镜参考图。道具将统一生成单张完整道具图。</p>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -2945,4 +3136,54 @@ onBeforeUnmount(() => {
 .gen-step-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 16px; }
 .gen-step-item { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); cursor: pointer; }
 .gen-dialog-section .form-hint { margin-top: 10px; }
+/* ================= 分镜体检 ================= */
+.sb-issue-panel {
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--lmd-border, rgba(255, 255, 255, 0.08));
+  background: rgba(245, 158, 11, 0.06);
+}
+.sb-issue-panel.inline {
+  margin-top: 12px;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.06);
+}
+.sb-issue-row {
+  display: flex;
+  gap: 8px;
+  padding: 3px 0;
+}
+.sb-issue-num {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: #d9a441;
+  font-variant-numeric: tabular-nums;
+}
+.sb-issue-list { flex: 1; min-width: 0; }
+.sb-issue-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: #d8c9a3;
+  cursor: default;
+}
+.sb-issue-panel:not(.inline) .sb-issue-item { cursor: pointer; }
+.sb-issue-panel:not(.inline) .sb-issue-item:hover { color: #ffd479; }
+.sb-issue-item.error { color: #f2a0a0; }
+.sb-issue-item.warn { color: #e3c489; }
+/* 分镜列表项上的问题角标 */
+.sb-warn-dot {
+  display: inline-flex;
+  align-items: center;
+  color: #e3c489;
+}
+.sb-warn-dot.error { color: #f2a0a0; }
+/* 「N 处问题」按钮 */
+.lmd-btn-ghost.sm.warn { color: #e3c489; border-color: rgba(227, 196, 137, 0.4); }
+
 </style>

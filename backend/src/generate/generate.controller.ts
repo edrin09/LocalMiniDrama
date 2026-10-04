@@ -135,6 +135,23 @@ export class GenerateController {
   }
 
   // 单分镜完整生成（参考图 + 视频）
+  // ==================== 分镜配音（TTS） ====================
+  // 说明：TTS provider 此前已注册但从未被调用（audioUrl 只读不写），
+  // 导致「合成对白音轨」开关与方言配音设置全部形同虚设。现已接通真实链路。
+
+  @Post('storyboards/:id/generate-audio')
+  generateStoryboardAudio(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: { force?: boolean },
+  ) {
+    return this.generate.generateStoryboardAudio(id, body ?? {});
+  }
+
+  @Post('episodes/:id/generate-audio')
+  generateEpisodeAudio(@Param('id', ParseIntPipe) id: number) {
+    return this.generate.generateEpisodeAudio(id);
+  }
+
   @Post('storyboards/:id/generate')
   generateStoryboard(@Param('id', ParseIntPipe) id: number) {
     return this.generate.generateStoryboardBySbId(id);

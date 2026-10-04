@@ -109,6 +109,10 @@ export const generateApi = {
     http.post(`/storyboards/${id}/generate-image`, { force }).then((r) => r.data),
   generateStoryboardVideo: (id: number, force = false) =>
     http.post(`/storyboards/${id}/generate-video`, { force }).then((r) => r.data),
+  generateStoryboardAudio: (id: number, force = false) =>
+    http.post(`/storyboards/${id}/generate-audio`, { force }).then((r) => r.data),
+  generateEpisodeAudio: (episodeId: number) =>
+    http.post(`/episodes/${episodeId}/generate-audio`).then((r) => r.data),
   merge: (episodeId: number, cfg: Partial<MergeConfig>) =>
     http.post(`/episodes/${episodeId}/merge`, cfg).then((r) => r.data),
   resetEpisode: (episodeId: number) =>

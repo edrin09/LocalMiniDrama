@@ -66,6 +66,18 @@ export interface PropLike {
   prompt?: string | null;
 }
 
+/**
+ * 参考图声明项：随请求附上的每张参考图及其角色。
+ * index 为 1-based 序号（Agnes 官方约定「第一个图 = 主体」）。
+ */
+export interface ImageRef {
+  kind: 'character' | 'scene' | 'prop' | 'tail';
+  /** 角色名 / 场景地点 / 道具名 / '上一镜尾帧' */
+  name: string;
+  /** 仅内部计算时使用，由提示词构建按顺序填充 */
+  index?: number;
+}
+
 export interface StoryboardLike {
   number: number;
   dialogue?: string | null;
@@ -93,6 +105,65 @@ export function anchorStyleTag(style?: GenStyle): string {
   return `【风格:${style?.artStyle || 'cartoon'}|a2】`;
 }
 
+/**
+ * 剥离锚点里的程序内部标记（形如 【风格:cartoon|a2】）。
+ * 这些标记只用于「锚点是否需要按当前风格重建」的程序判断，
+ * 绝不能进入送给生图模型的提示词——模型会把方括号内容当成画面元素或乱码文字去渲染。
+ */
+export function stripAnchorMeta(text?: string | null): string {
+  return (text || '')
+    .replace(/【[^】]{0,40}】/g, '')
+    .replace(/^[；;，,、\s]+/, '')
+    .replace(/；{2,}/g, '；')
+    .trim();
+}
+
+/** 归一化标点与空白，用于「包含关系」比较（避免全角/半角差异导致漏判） */
+function normForCompare(s: string): string {
+  return s.replace(/[，,。、；;：:\s·・]/g, '');
+}
+
+/**
+ * 剔除锚点里与全局风格锚点重复的部分。
+ * 锚点以「角色特征」为唯一职责，画面风格由 styleAnchorOf() 统一注入；
+ * 若不剔除，同一段风格词会在提示词里出现两次，白白稀释人物特征的权重，
+ * 也让「切换风格」时锚点里残留旧风格词、把新风格带偏（旧数据全部命中此路径）。
+ *
+ * 判据是「归一化后的公共前缀」：历史锚点里的风格片段几乎总是全局风格锚点的
+ * 前若干个逗号分句（如「2D卡通动漫风格，日系赛璐璐动画质感，明亮大眼」），
+ * 中间会跳过若干分句，因此它既不是 styleAnchor 的子串、styleAnchor 也不是它的子串
+ * —— 只做 contains 双向判断会漏判，风格词根本没被剔除。
+ * 这里改判前缀重合度：片段开头与风格锚点开头重合达 6 个字符以上即视为风格词。
+ * 剔除后若结果为空则回退原文，宁可重复也不丢人物特征。
+ */
+export function dedupeStyleAnchor(text: string, style?: GenStyle): string {
+  const raw = (text || '').trim();
+  if (!raw) return '';
+  const styleAnchor = normForCompare(styleAnchorOf(style));
+  if (styleAnchor.length < 8) return raw;
+  const kept = raw
+    .split(/[；;\n]/)
+    .filter((seg) => {
+      const n = normForCompare(seg);
+      if (n.length < 4) return true; // 太短的片段（如「黑短发」）不参与判定
+      let prefix = 0;
+      while (
+        prefix < n.length &&
+        prefix < styleAnchor.length &&
+        n[prefix] === styleAnchor[prefix]
+      ) {
+        prefix += 1;
+      }
+      const isStyle = prefix >= 6 || n.includes(styleAnchor);
+      return !isStyle;
+    })
+    .join('；')
+    .replace(/^[；;，,、\s]+/, '')
+    .replace(/[；;，,、\s]+$/, '')
+    .trim();
+  return kept || raw;
+}
+
 /** 语言一致性约束（针对音轨与口型，覆盖角色对白与旁白，不再提及“画面文字”，避免诱导模型烧字） */
 export function languageConstraint(style?: GenStyle): string {
   const lang = style?.language || 'zh-CN';
@@ -108,6 +179,14 @@ export function singingConstraint(style?: GenStyle): string {
     return '允许唱词，但歌词必须为中文普通话，且全片唱词风格保持一致';
   }
   return '禁止唱歌、禁止哼唱、禁止演唱、禁止配乐歌词，画面人物不得歌唱';
+}
+
+/** 首帧一致性自动审核结果 */
+export interface FirstFrameAudit {
+  pass: boolean;
+  issues: string[];
+  /** 模型原始判定（如 A=no B=yes），用于日志排查 */
+  reasons: string[];
 }
 
 @Injectable()
@@ -159,15 +238,23 @@ export class PromptService {
     return `${anchorStyleTag(style)}${styleAnchorOf(style)}；${text}`;
   }
 
-  /** 角色锚点文案：锚点缺失时直接用外貌原文（含服饰），不再剔除服饰词 */
-  anchorTextOf(c: CharacterLike): string {
-    return (c.anchors || c.appearance || '').trim();
+  /**
+   * 角色锚点文案（注入提示词用）。
+   * 锚点缺失时回退外貌原文（含服饰），并统一做两件事：
+   * ① 剥离程序内部标记【风格:…】；② 剔除与全局风格锚点重复的片段。
+   * 两者都不做的话，生图提示词里会同时出现乱码标记和重复的风格词，
+   * 稀释人物特征权重 —— 这正是「角色统一化做得很烂」的直接原因之一。
+   */
+  anchorTextOf(c: CharacterLike, style?: GenStyle): string {
+    const raw = (c.anchors || c.appearance || '').trim();
+    if (!raw) return '';
+    return dedupeStyleAnchor(stripAnchorMeta(raw), style);
   }
 
   // ==================== 素材提示词 ====================
 
   characterImagePrompt(c: CharacterLike, style?: GenStyle): string {
-    const anchors = this.anchorTextOf(c);
+    const anchors = this.anchorTextOf(c, style);
     const parts = [
       styleAnchorOf(style),
       `角色名：${c.name}`,
@@ -226,7 +313,7 @@ export class PromptService {
    * 分镜首帧：把角色锚点（含服装）+ 场景 + 道具全部注入画面内，
    * 靠这张图保证后续视频里的人物一致性。
    * - 服装颜色与款式显式锁定到角色形象参考图（此前只锁面部/发型，服装随意漂移）
-   * - refNames：随请求附上的角色形象参考图对应角色名（按顺序），用于声明参考图与角色的对应关系
+   * - refs：随请求附上的参考图及其角色（按顺序，1-based），用于按官方四段式声明图间关系
    * 注意：台词绝不以文字形式出现在画面里（画字=乱码），只描述说话神态。
    */
   storyboardImagePrompt(
@@ -238,11 +325,13 @@ export class PromptService {
       prop?: PropLike | null;
       props?: PropLike[] | null;
       refNames?: string[] | null;
+      refs?: ImageRef[] | null;
       hasTailRef?: boolean;
     },
     style?: GenStyle,
   ): string {
-    const { sb, character, characters, scene, prop, props, refNames, hasTailRef } = ctx;
+    const { sb, character, characters, scene, prop, props, refNames, refs, hasTailRef } =
+      ctx;
     const custom = sb.imagePrompt?.trim();
 
     // 归一化角色列表：优先 characters，回退单值 character
@@ -253,19 +342,41 @@ export class PromptService {
         : [];
     const propList: PropLike[] = props?.length ? props : prop ? [prop] : [];
     const refNameList = refNames || [];
+    // 权威参考图声明：有 refs 用 refs（含场景/道具/尾帧），否则回退旧的 refNames
+    const refList: ImageRef[] = (refs && refs.length > 0
+      ? refs
+      : refNameList.map((name) => ({ kind: 'character' as const, name }))
+    ).map((r, i) => ({ ...r, index: i + 1 }));
 
-    // 角色主体描述：多角色逐个锁定；服装与配色必须与形象参考图一致
+    // 角色主体描述：多角色逐个锁定；服装与配色必须与形象参考图一致。
+    // 关键：多角色同框时必须显式锁定「画面里恰好有几个人」并禁止特征互串，
+    // 否则模型会把两人画成一个人（特征平均化）或张冠李戴（甲穿乙的衣服）。
     const charDesc = charList.length
-      ? charList
-          .map((c) => {
-            const refIdx = refNameList.indexOf(c.name);
-            const refNote =
-              refIdx >= 0 ? `（其形象立绘为参考图第 ${refIdx + 1} 张）` : '';
-            return (
-              `角色「${c.name}」：${this.anchorTextOf(c)}，` +
-              `其面部五官、发型发色、体型以及服装的颜色与款式必须与其形象参考图完全一致，不得更换服装、不得改变服装颜色${refNote}`
-            );
-          })
+      ? [
+          charList.length > 1
+            ? `画面中恰好有 ${charList.length} 个人物，每位人物各自独立、互不融合，禁止把不同角色的五官或服装特征混到同一个人身上，禁止多画或少画人物`
+            : '画面中恰好有 1 个人物',
+          // MSR 论文指认的最高危失败模式：服装相近 → 参考图混淆 / 特征平均化。
+          // 零成本对策：显式要求各角色服装主色互斥。
+          charList.length > 1
+            ? '服装配色要求：各角色的服装主色必须彼此明显不同，禁止两人服装颜色或款式相近'
+            : '',
+          charList
+            .map((c, i) => {
+              const ref = refList.find(
+                (r) => r.kind === 'character' && r.name === c.name,
+              );
+              const refNote = ref ? `（其形象立绘为参考图第 ${ref.index} 张）` : '';
+              const roleNote =
+                charList.length > 1 ? `画面中第 ${i + 1} 位人物，` : '';
+              return (
+                `${roleNote}即角色「${c.name}」：${this.anchorTextOf(c, style)}，` +
+                `其面部五官、发型发色、体型以及服装的颜色与款式必须与其形象参考图完全一致，不得更换服装、不得改变服装颜色${refNote}`
+              );
+            })
+            .join('；'),
+        ]
+          .filter(Boolean)
           .join('；')
       : '画面无人物主体，纯环境与氛围';
 
@@ -275,12 +386,12 @@ export class PromptService {
           .join('、')}`
       : '';
 
-    const refNote =
-      refNameList.length > 0
-        ? hasTailRef
-          ? `所附参考图按顺序依次为上述角色的形象立绘（最后一张为上一镜画面衔接参考，非角色形象），人物外貌与服装以角色形象立绘为准`
-          : '所附参考图按顺序依次为上述角色的形象立绘，人物外貌与服装以参考图为准'
-        : '';
+    // 官方四段式之「图间关系」：显式说明每张参考图的角色与排序。
+    // 缺失这一段时模型容易把场景图当人物、或把尾帧当主体（reference confusion）。
+    const refNote = this.referenceRelationNote(refList, {
+      sceneLocation: scene?.location,
+      hasTailRef,
+    });
 
     const composed = [
       styleAnchorOf(style),
@@ -303,6 +414,42 @@ export class PromptService {
     return custom ? `${custom}；${composed.join('，')}` : composed.join('，');
   }
 
+  /**
+   * 参考图「图间关系」声明（Agnes 官方多图推荐结构的第三段）。
+   * 按官方示例「第一个图 = 主体」组织：角色立绘在前，场景/道具/尾帧在后。
+   */
+  private referenceRelationNote(
+    refs: ImageRef[],
+    opt: { sceneLocation?: string; hasTailRef?: boolean } = {},
+  ): string {
+    if (refs.length === 0) return '';
+    const parts = refs.map((r) => {
+      switch (r.kind) {
+        case 'character':
+          return `第${r.index}张为角色「${r.name}」的形象立绘`;
+        case 'scene':
+          return `第${r.index}张为场景「${r.name}」的参考图`;
+        case 'prop':
+          return `第${r.index}张为道具「${r.name}」的参考图`;
+        case 'tail':
+          return `第${r.index}张为上一镜的画面衔接参考（非人物立绘）`;
+        default:
+          return `第${r.index}张为参考图`;
+      }
+    });
+    const rule = [
+      '参考图按所附顺序编号，以下各图的角色与相互关系为：',
+      parts.join('；'),
+      refs.some((r) => r.kind === 'character')
+        ? '以第1张图的人物为主体，其余图片仅用于约束空间、道具与镜头连续性，不得把场景图或道具图里的人物混入主体'
+        : '',
+      opt.hasTailRef ? '尾帧参考图仅用于保持与上一镜的画面连续，不得照搬其人物身份' : '',
+    ]
+      .filter(Boolean)
+      .join('；');
+    return rule;
+  }
+
   /** 尾帧：与首帧同一场景与人物（含服装），呈现动作后的结束状态 */
   storyboardLastFramePrompt(
     ctx: {
@@ -320,9 +467,17 @@ export class PromptService {
         ? [character]
         : [];
     const charDesc = charList.length
-      ? charList
-          .map((c) => `同一角色「${c.name}」：${this.anchorTextOf(c)}，面部、发型、体型以及服装的颜色与款式必须与首帧保持完全一致`)
-          .join('；')
+      ? [
+          charList.length > 1
+            ? `画面中仍是同样的 ${charList.length} 个人物，位置与人数不变，禁止把不同角色的五官或服装特征混到同一个人身上`
+            : '画面中仍是同一个人物',
+          charList
+            .map(
+              (c) =>
+                `同一角色「${c.name}」：${this.anchorTextOf(c, style)}，面部、发型、体型以及服装的颜色与款式必须与首帧保持完全一致`,
+            )
+            .join('；'),
+        ].join('；')
       : '同一环境，无人物主体';
     return [
       styleAnchorOf(style),
@@ -366,7 +521,7 @@ export class PromptService {
     let lock: string;
     if (refNames.length > 0) {
       lock =
-        `硬约束：` +
+        `硬约束：画面中恰好 ${charList.length} 个人物，全程人数与身份不变，禁止多人互相融合或特征互串；` +
         charList
           .map((c, i) => {
             const pic = i < refNames.length ? `<Picture ${i + 1}>` : '';
@@ -375,11 +530,11 @@ export class PromptService {
           .join('；');
     } else if (charList.length > 0) {
       lock =
-        `硬约束：` +
+        `硬约束：画面中恰好 ${charList.length} 个人物，全程人数与身份不变，禁止多人互相融合或特征互串；` +
         charList
           .map((c) => `${c.name}的面部、发型、体型与服装在整段视频中保持完全不变，不得换脸、不得变形`)
           .join('；') +
-        `；角色外貌：${charList.map((c) => `${c.name}（${this.anchorTextOf(c)}）`).join('；')}`;
+        `；角色外貌：${charList.map((c) => `${c.name}（${this.anchorTextOf(c, style)}）`).join('；')}`;
     } else {
       lock = '硬约束：画面构图与场景元素在整段视频中保持稳定';
     }
@@ -446,6 +601,75 @@ export class PromptService {
     } catch (e: any) {
       this.logger.warn(`参考图描述提取失败：${e.message}`);
       return null;
+    }
+  }
+
+  /**
+   * 首帧一致性自动审核（VLM 质检）。
+   *
+   * 依据：Agnes 的 agnes-2.5-flash 本身支持图片理解（describeImage / detectRotation
+   * 已在用同一能力），因此无需新增供应商即可对生成的首帧做自动质检。
+   * 产业共识「审核先于重做」：能修的别重做，身份已崩的别硬救。
+   *
+   * 只在模型可用时执行；任何异常都返回 pass（不阻断主流程）。
+   */
+  async auditFirstFrame(
+    refUris: string[],
+    frameUri: string,
+    expectCharacters: Array<{ name: string; anchor?: string | null }>,
+  ): Promise<FirstFrameAudit> {
+    const empty: FirstFrameAudit = { pass: true, issues: [], reasons: [] };
+    if (!frameUri || refUris.length === 0) return empty;
+    if (!this.factory.isLive('text')) return empty;
+
+    const names = expectCharacters.map((c) => c.name).filter(Boolean);
+    const prompt =
+      '你是分镜质检员。最后一张图是待检首帧，前面的图是它的参考图（角色立绘）。' +
+      '请逐项判断，每项只回答 yes 或 no：' +
+      'A) 首帧中每个人的脸型与发型是否与对应角色立绘一致？（一致=yes，不一致=no）' +
+      'B) 服装的颜色与款式是否与角色立绘一致？（一致=yes，不一致=no）' +
+      'C) 是否存在两个角色的五官或服装特征被混到同一个人身上？（存在=yes，不存在=no）' +
+      'D) 画面中是否出现了文字、字幕或水印？（出现=yes，没有=no）' +
+      (names.length ? `本镜预期出场角色：${names.join('、')}。` : '') +
+      '严格按以下格式输出 4 行，每行一个字母加等号，不要任何解释：\n' +
+      'A=yes\nB=yes\nC=no\nD=no';
+
+    try {
+      const provider = this.factory.resolve('text');
+      const res = await provider.generate('text', {
+        prompt,
+        options: {
+          images: [...refUris, frameUri].slice(0, 8),
+          temperature: 0,
+          maxTokens: 40,
+        },
+      });
+      const text = (res.text || '').toUpperCase();
+      const issues: string[] = [];
+      const reasons: string[] = [];
+      // polarity：'bad=yes' 表示该项答 yes 才是问题（C/D 是反向问句，不能与 A/B 同判）
+      const rules: Array<[string, 'bad=yes' | 'bad=no', string]> = [
+        ['A', 'bad=no', '人物脸型/发型与立绘参考图不一致'],
+        ['B', 'bad=no', '服装颜色或款式与立绘参考图不一致'],
+        ['C', 'bad=yes', '疑似多个角色的五官/服装特征混到同一个人身上（串脸）'],
+        ['D', 'bad=yes', '画面中出现文字/字幕/水印'],
+      ];
+      for (const [key, polarity, msg] of rules) {
+        const m = text.match(new RegExp(`\\b${key}\\s*=\\s*(YES|NO)`));
+        // 解析不出该项时跳过（模型没按格式回答，不应据此判失败）
+        if (!m) continue;
+        const failed = polarity === 'bad=yes' ? m[1] === 'YES' : m[1] === 'NO';
+        if (failed) {
+          issues.push(msg);
+          reasons.push(`${key}=${m[1].toLowerCase()}`);
+        }
+      }
+
+      return { pass: issues.length === 0, issues, reasons };
+    } catch (e: any) {
+      // 质检失败不阻断生成：宁可放过，不可卡死流水线
+      this.logger.warn(`首帧自动审核失败（已跳过）：${e.message}`);
+      return empty;
     }
   }
 
