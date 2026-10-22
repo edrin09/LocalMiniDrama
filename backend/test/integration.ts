@@ -113,6 +113,26 @@ async function main() {
   const l2 = await script.listStoryboards(ep.id);
   eq2('list order stable with dup numbers', l1.map((s: any) => s.id).join(','), l2.map((s: any) => s.id).join(','));
 
+  // ============ 时长自动校准（无需用户点按钮） ============
+  const target = afterDel[0];
+  const longLine = '这是一句非常长的台词'.repeat(6); // 72 字 → 远超 5s
+  const bumped = await script.updateStoryboard(target.id, { dialogue: longLine, duration: 5 } as any);
+  eq2('auto-fit raises too-short duration', bumped.duration > 5, true);
+  eq2('auto-fit keeps duration within cap', bumped.duration <= 12, true);
+
+  // 显式填更长值必须保留（情绪镜需要留白），不能被压回
+  const kept = await script.updateStoryboard(target.id, { duration: 12 } as any);
+  eq2('auto-fit respects explicit longer value', kept.duration, 12);
+
+  // 只改台词、不传 duration 时也要重新校准（此前最容易漏掉的路径）
+  await script.updateStoryboard(target.id, { duration: 4 } as any);
+  const refit = await script.updateStoryboard(target.id, { dialogue: longLine } as any);
+  eq2('auto-fit reruns when only dialogue changes', refit.duration > 4, true);
+
+  // 无台词镜：不得被无故改动
+  const empty = await script.updateStoryboard(target.id, { dialogue: '', narration: '', duration: 6 } as any);
+  eq2('auto-fit leaves silent shot alone', empty.duration, 6);
+
   await prisma.$disconnect();
   try { fs.unlinkSync(tmpDb); } catch { /* ignore */ }
   console.log(fail2 === 0 ? '\nALL PASS (integration)' : `\n${fail2} FAILED (integration)`);

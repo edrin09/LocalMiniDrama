@@ -4,8 +4,17 @@ import { useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { Plus, Upload, Edit, Delete, Download, Setting, Cpu } from '@element-plus/icons-vue';
 import { dramaApi, configApi } from '@/api';
-import { DIALECT_MAP, dialectLabel, COVER_STYLES, PROGRESS_MAP } from '@/utils/dialect';
-import type { Drama, SchedulerConfig, AiConfig } from '@/types';
+import {
+  DIALECT_MAP,
+  dialectLabel,
+  COVER_STYLES,
+  PROGRESS_MAP,
+  ASPECT_RATIOS,
+  FRAME_RATES,
+  RESOLUTIONS,
+  DEFAULT_OUTPUT_SPEC,
+} from '@/utils/dialect';
+import type { Drama, SchedulerConfig, AiConfig, OutputSpec } from '@/types';
 
 const router = useRouter();
 const loading = ref(false);
@@ -19,20 +28,23 @@ const form = reactive({
   description: '',
   dialect: 'standard',
   coverStyle: 'default',
+  // 成片规格：建项目时定，生图/生视频/合成全流程共用（见 utils/dialect）
+  aspect_ratio: DEFAULT_OUTPUT_SPEC.aspect_ratio as string,
+  frame_rate: DEFAULT_OUTPUT_SPEC.frame_rate as number,
+  resolution: DEFAULT_OUTPUT_SPEC.resolution as string,
 });
 
-// ===== 配置弹窗 =====
-const showSchedulerConfig = ref(false);
-const showAiConfig = ref(false);
+// ===== 全局配置弹窗（调度 + AI 合一） =====
+const showSettings = ref(false);
+const savingSettings = ref(false);
+const settingsTab = ref<'ai' | 'scheduler'>('ai');
 const schedulerConfig = ref<SchedulerConfig>({
   max_image_concurrency: 3,
   max_video_concurrency: 2,
   max_retries: 5,
   retry_initial_delay_ms: 1000,
 });
-const savingScheduler = ref(false);
 const aiConfig = ref<AiConfig | null>(null);
-const savingAi = ref(false);
 
 async function loadProjects() {
   loading.value = true;
@@ -50,6 +62,9 @@ function openCreate() {
   form.description = '';
   form.dialect = 'standard';
   form.coverStyle = 'default';
+  form.aspect_ratio = DEFAULT_OUTPUT_SPEC.aspect_ratio;
+  form.frame_rate = DEFAULT_OUTPUT_SPEC.frame_rate;
+  form.resolution = DEFAULT_OUTPUT_SPEC.resolution;
   showProjectModal.value = true;
 }
 
@@ -69,6 +84,12 @@ async function saveProject() {
       description: form.description,
       dialect: form.dialect,
       coverStyle: form.coverStyle,
+      // 成片规格在创建时定下，之后全流程只读
+      outputCfg: {
+        aspect_ratio: form.aspect_ratio as OutputSpec['aspect_ratio'],
+        frame_rate: form.frame_rate,
+        resolution: form.resolution as OutputSpec['resolution'],
+      },
     });
     ElMessage.success('项目创建成功');
     showProjectModal.value = false;
@@ -120,50 +141,44 @@ function openProject(p: Drama) {
   router.push(`/project/${p.id}`);
 }
 
-// ===== 调度配置 =====
-async function openScheduler() {
+// ===== 全局配置（调度 + AI 合并为一个弹窗） =====
+async function openSettings() {
   try {
-    schedulerConfig.value = { ...schedulerConfig.value, ...(await configApi.getScheduler()) };
+    const s = await configApi.getSettings();
+    schedulerConfig.value = { ...schedulerConfig.value, ...s.scheduler };
+    aiConfig.value = JSON.parse(JSON.stringify(s.ai));
   } catch (e: any) {
     ElMessage.error(e.message);
   }
-  showSchedulerConfig.value = true;
+  showSettings.value = true;
 }
-async function saveScheduler() {
-  savingScheduler.value = true;
+
+/** 一次 PUT 同时保存调度与 AI：避免两个弹窗两次请求、配置互相覆盖 */
+async function saveSettings() {
+  if (!aiConfig.value) return;
+  savingSettings.value = true;
   try {
-    schedulerConfig.value = await configApi.setScheduler(schedulerConfig.value);
-    ElMessage.success('调度配置已保存');
-    showSchedulerConfig.value = false;
+    const s = await configApi.setSettings({
+      scheduler: schedulerConfig.value,
+      ai: aiConfig.value,
+    });
+    schedulerConfig.value = { ...schedulerConfig.value, ...s.scheduler };
+    aiConfig.value = JSON.parse(JSON.stringify(s.ai));
+    ElMessage.success('全局配置已保存并立即生效');
+    showSettings.value = false;
   } catch (e: any) {
     ElMessage.error(e.message);
   } finally {
-    savingScheduler.value = false;
+    savingSettings.value = false;
   }
 }
 
-// ===== AI 配置 =====
-async function openAi() {
-  try {
-    aiConfig.value = await configApi.getAi();
-  } catch (e: any) {
-    ElMessage.error(e.message);
-  }
-  showAiConfig.value = true;
-}
-async function saveAi() {
-  if (!aiConfig.value) return;
-  savingAi.value = true;
-  try {
-    aiConfig.value = await configApi.setAi(aiConfig.value);
-    ElMessage.success('AI 配置已保存');
-    showAiConfig.value = false;
-  } catch (e: any) {
-    ElMessage.error(e.message);
-  } finally {
-    savingAi.value = false;
-  }
-}
+/** Agnes 三件套模型的可选项（可自由输入以支持官方新增模型） */
+const MODEL_FIELDS = [
+  { key: 'text', label: '文本模型', hint: '剧本拆解 / 提示词优化 / 首帧质检' },
+  { key: 'image', label: '生图模型', hint: '角色立绘 / 场景图 / 分镜首尾帧' },
+  { key: 'video', label: '视频模型', hint: '分镜视频生成' },
+] as const;
 
 function formatDate(s: string) {
   if (!s) return '';
@@ -196,11 +211,8 @@ onMounted(loadProjects);
           </div>
         </div>
         <div class="flex items-center gap-3">
-          <button class="lmd-btn-ghost" @click="openScheduler">
-            <el-icon class="mr-1"><Setting /></el-icon>调度配置
-          </button>
-          <button class="lmd-btn-ghost" @click="openAi">
-            <el-icon class="mr-1"><Cpu /></el-icon>AI配置
+          <button class="lmd-btn-ghost" @click="openSettings">
+            <el-icon class="mr-1"><Setting /></el-icon>全局配置
           </button>
         </div>
       </div>
@@ -305,6 +317,37 @@ onMounted(loadProjects);
               <option v-for="c in COVER_STYLES" :key="c.value" :value="c.value">{{ c.label }}</option>
             </select>
           </div>
+          <!-- 成片规格：建项目时定，生图/生视频/合成全流程共用。
+               画幅是生成参数而非后期裁切参数，一旦开始生成便不可更改。 -->
+          <div class="spec-block">
+            <label class="lmd-label">
+              成片规格
+              <span class="lmd-hint-inline">建项目时确定，生成后不可更改</span>
+            </label>
+            <div class="spec-grid">
+              <div>
+                <label class="lmd-label sm">画面比例</label>
+                <select v-model="form.aspect_ratio" class="lmd-input">
+                  <option v-for="a in ASPECT_RATIOS" :key="a.value" :value="a.value">{{ a.label }}</option>
+                </select>
+              </div>
+              <div>
+                <label class="lmd-label sm">帧率</label>
+                <select v-model="form.frame_rate" class="lmd-input">
+                  <option v-for="f in FRAME_RATES" :key="f.value" :value="f.value">{{ f.label }}</option>
+                </select>
+              </div>
+              <div>
+                <label class="lmd-label sm">输出清晰度</label>
+                <select v-model="form.resolution" class="lmd-input">
+                  <option v-for="r in RESOLUTIONS" :key="r.value" :value="r.value">{{ r.label }}</option>
+                </select>
+              </div>
+            </div>
+            <p class="lmd-range-hint">
+              所有角色立绘、场景图、分镜首尾帧与视频都会按此规格生成，合成时直接沿用。
+            </p>
+          </div>
         </div>
         <div class="flex justify-end gap-3 mt-6">
           <button class="lmd-btn-ghost" @click="closeModal">取消</button>
@@ -316,10 +359,90 @@ onMounted(loadProjects);
     </div>
 
     <!-- ===== 调度配置弹窗 ===== -->
-    <div v-if="showSchedulerConfig" class="lmd-mask" @click.self="showSchedulerConfig = false">
-      <div class="lmd-modal" style="max-width: 560px">
-        <h3 class="lmd-modal-title">⚙️ 调度配置</h3>
-        <div class="space-y-6 mt-6">
+    <!-- ===== 全局配置弹窗（AI + 调度 合一，一次保存） ===== -->
+    <div v-if="showSettings" class="lmd-mask" @click.self="showSettings = false">
+      <div class="lmd-modal" style="max-width: 680px">
+        <h3 class="lmd-modal-title">⚙️ 全局配置</h3>
+        <div class="settings-tabs mt-5">
+          <button class="settings-tab" :class="{ active: settingsTab === 'ai' }" @click="settingsTab = 'ai'">
+            <el-icon class="mr-1"><Cpu /></el-icon>AI 配置
+          </button>
+          <button class="settings-tab" :class="{ active: settingsTab === 'scheduler' }" @click="settingsTab = 'scheduler'">
+            <el-icon class="mr-1"><Setting /></el-icon>调度配置
+          </button>
+        </div>
+
+        <!-- AI 配置：可换 Key 与模型，保存后立即生效，无需重启后端 -->
+        <div v-if="settingsTab === 'ai'" class="space-y-5 mt-5">
+          <template v-if="aiConfig">
+            <div>
+              <label class="lmd-label">默认 Provider</label>
+              <select v-model="aiConfig.defaultProvider" class="lmd-input">
+                <option v-for="k in Object.keys(aiConfig.providers || {})" :key="k" :value="k">
+                  {{ aiConfig.providers[k].name || k }}
+                </option>
+              </select>
+              <p class="lmd-range-hint mt-1">剧本拆解 / 生图 / 生视频默认走该平台</p>
+            </div>
+
+            <!-- Agnes：Key + BaseURL + 三件套模型 -->
+            <div v-if="aiConfig.providers?.agnes" class="settings-card">
+              <div class="settings-card-title">Agnes（文本 / 图片 / 视频）</div>
+              <div class="space-y-3 mt-3">
+                <div>
+                  <label class="lmd-label">API Key</label>
+                  <input
+                    v-model="aiConfig.providers.agnes.apiKey"
+                    class="lmd-input mono"
+                    type="password"
+                    :placeholder="aiConfig.providers.agnes.apiKeySet ? '已配置（留空则保持不变）' : '未配置，粘贴你的 API Key'"
+                    autocomplete="off"
+                  />
+                  <p class="lmd-range-hint mt-1">留空保持不变；填写新 Key 将在保存后立即生效</p>
+                </div>
+                <div>
+                  <label class="lmd-label">Base URL</label>
+                  <input v-model="aiConfig.providers.agnes.baseUrl" class="lmd-input mono" placeholder="https://api.agnes-ai.cn/v1" />
+                </div>
+                <div v-for="m in MODEL_FIELDS" :key="m.key">
+                  <label class="lmd-label">{{ m.label }}</label>
+                  <input v-model="aiConfig.providers.agnes.models[m.key]" class="lmd-input mono" />
+                  <p class="lmd-range-hint mt-1">{{ m.hint }}</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- 火山引擎 TTS：可换凭据 -->
+            <div v-if="aiConfig.tts" class="settings-card">
+              <div class="settings-card-title">火山引擎 TTS（配音，可选）</div>
+              <p class="lmd-range-hint mt-1">不配置则自动回退到免费 edge-tts，配音仍为中文</p>
+              <div class="settings-grid mt-3">
+                <div>
+                  <label class="lmd-label">App ID</label>
+                  <input v-model="aiConfig.tts.appId" class="lmd-input mono" type="password"
+                    :placeholder="aiConfig.tts.appIdSet ? '已配置（留空保持）' : '未配置'" autocomplete="off" />
+                </div>
+                <div>
+                  <label class="lmd-label">Resource Token</label>
+                  <input v-model="aiConfig.tts.token" class="lmd-input mono" type="password"
+                    :placeholder="aiConfig.tts.tokenSet ? '已配置（留空保持）' : '未配置'" autocomplete="off" />
+                </div>
+                <div>
+                  <label class="lmd-label">Cluster</label>
+                  <input v-model="aiConfig.tts.cluster" class="lmd-input mono" placeholder="volcano_tts" />
+                </div>
+                <div>
+                  <label class="lmd-label">默认音色（可选）</label>
+                  <input v-model="aiConfig.tts.defaultVoice" class="lmd-input mono"
+                    :placeholder="aiConfig.tts.defaultVoiceSet ? '已配置（留空保持）' : '按方言自动映射'" />
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+
+    <!-- 调度配置（同一弹窗的第二页，保存时与 AI 配置一并提交） -->
+        <div v-else class="space-y-6 mt-5">
           <div class="lmd-range-row">
             <div class="flex justify-between">
               <span class="lmd-range-label">图片生成并发数</span>
@@ -353,36 +476,11 @@ onMounted(loadProjects);
             <p class="lmd-range-hint">首次重试前的等待时间（指数退避）</p>
           </div>
         </div>
-        <div class="flex justify-end gap-3 mt-6">
-          <button class="lmd-btn-ghost" @click="showSchedulerConfig = false">关闭</button>
-          <button class="lmd-btn-primary" :disabled="savingScheduler" @click="saveScheduler">
-            {{ savingScheduler ? '保存中...' : '保存配置' }}
-          </button>
-        </div>
-      </div>
-    </div>
 
-    <!-- ===== AI 配置弹窗 ===== -->
-    <div v-if="showAiConfig" class="lmd-mask" @click.self="showAiConfig = false">
-      <div class="lmd-modal" style="max-width: 620px">
-        <h3 class="lmd-modal-title">🤖 AI 配置</h3>
-        <template v-if="aiConfig">
-          <div class="space-y-4 mt-6">
-            <div>
-              <label class="lmd-label">默认 Provider</label>
-              <input v-model="aiConfig.defaultProvider" class="lmd-input" />
-            </div>
-            <div>
-              <label class="lmd-label">Provider 详情</label>
-              <textarea :value="JSON.stringify(aiConfig.providers, null, 2)" rows="10" class="lmd-input mono" readonly></textarea>
-              <p class="lmd-range-hint mt-1">敏感 Key 存于 .env，此处仅展示非敏感配置</p>
-            </div>
-          </div>
-        </template>
         <div class="flex justify-end gap-3 mt-6">
-          <button class="lmd-btn-ghost" @click="showAiConfig = false">取消</button>
-          <button class="lmd-btn-primary" :disabled="savingAi" @click="saveAi">
-            {{ savingAi ? '保存中...' : '保存配置' }}
+          <button class="lmd-btn-ghost" @click="showSettings = false">取消</button>
+          <button class="lmd-btn-primary" :disabled="savingSettings" @click="saveSettings">
+            {{ savingSettings ? '保存中...' : '保存配置' }}
           </button>
         </div>
       </div>
@@ -391,6 +489,42 @@ onMounted(loadProjects);
 </template>
 
 <style scoped>
+/* 全局配置弹窗：Tab 分页 + Provider 分组卡片 */
+.settings-tabs {
+  display: flex;
+  gap: 6px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0;
+}
+.settings-tab {
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 16px;
+  font-size: 13px;
+  color: var(--muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+}
+.settings-tab.active {
+  color: var(--indigo, #6366f1);
+  border-bottom-color: var(--indigo, #6366f1);
+  font-weight: 600;
+}
+.settings-card {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(99, 102, 241, 0.04);
+}
+.settings-card-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+
 .lmd-topbar {
   background: rgba(255, 255, 255, 0.92);
   border-bottom: 1px solid var(--border);
@@ -478,6 +612,25 @@ onMounted(loadProjects);
 .lmd-range-val.pink { color: #ec4899; }
 .lmd-range-val.emerald { color: var(--emerald); }
 .lmd-range-hint { font-size: 12px; color: var(--muted); margin: 2px 0 0; }
+/* 成片规格块：建项目时确定，需与普通表单项区分开（不可逆决策） */
+.spec-block {
+  padding: 12px;
+  border: 1px solid rgba(99, 102, 241, 0.28);
+  border-radius: 8px;
+  background: rgba(99, 102, 241, 0.06);
+}
+.spec-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.spec-grid .lmd-label.sm { font-size: 12px; font-weight: 500; margin-bottom: 4px; }
+.lmd-hint-inline {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 400;
+  color: #a5b4fc;
+}
 .space-y-4 > * + * { margin-top: 16px; }
 .space-y-6 > * + * { margin-top: 24px; }
 </style>

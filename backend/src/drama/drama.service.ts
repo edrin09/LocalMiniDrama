@@ -1,6 +1,8 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateDramaDto, UpdateDramaDto } from './dto/drama.dto';
+// 成片规格的唯一真相源：建项目时定，生图/生视频/合成共用
+import { DEFAULT_OUTPUT_SPEC, parseOutputSpec } from '../output-spec';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -17,6 +19,7 @@ export class DramaService {
     description: true,
     dialect: true,
     coverStyle: true,
+    outputCfg: true,
     seed: true,
     createdAt: true,
     updatedAt: true,
@@ -71,6 +74,8 @@ export class DramaService {
       description: dto.description ?? null,
       dialect: dto.dialect ?? 'standard',
       coverStyle: dto.coverStyle ?? 'default',
+      // 成片规格在创建时就定下：画幅/帧率/清晰度此后全流程只读不再改
+      outputCfg: JSON.stringify(parseOutputSpec(dto.outputCfg ?? DEFAULT_OUTPUT_SPEC)),
       seed: dto.seed ?? this.randomSeed(),
     };
     // 说明：物理目录用 dramaId（见 ensureUploadDir），标题与目录名无关，此处无需再处理。
@@ -92,6 +97,9 @@ export class DramaService {
       data.description = dto.description ?? null;
     if (dto.dialect !== undefined) data.dialect = dto.dialect ?? 'standard';
     if (dto.coverStyle !== undefined) data.coverStyle = dto.coverStyle ?? null;
+    if (dto.outputCfg !== undefined) {
+      data.outputCfg = JSON.stringify(parseOutputSpec(dto.outputCfg));
+    }
     if (dto.seed !== undefined) data.seed = dto.seed;
 
     return this.prisma.drama.update({ where: { id }, data });

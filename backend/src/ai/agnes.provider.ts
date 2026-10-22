@@ -22,6 +22,8 @@ const MODELS = {
 interface AgnesConfig {
   baseUrl: string;
   apiKey: string;
+  /** 可在全局配置里更换的模型名（缺省回落到官方三件套） */
+  models?: Partial<typeof MODELS>;
 }
 
 export class AgnesProvider implements AIProvider {
@@ -29,12 +31,21 @@ export class AgnesProvider implements AIProvider {
   readonly type = 'aggregate' as const;
 
   private readonly config: AgnesConfig;
+  /** 实际生效的模型（配置优先，其次官方默认） */
+  private readonly models: typeof MODELS;
 
   constructor(config?: Partial<AgnesConfig>) {
     this.config = {
       baseUrl: config?.baseUrl || process.env.AGNES_BASE_URL || DEFAULT_BASE,
+      // 配置里的 Key 优先于 .env：用户能在界面换 Key，正是为了不再改代码/重启
       apiKey: config?.apiKey || process.env.AGNES_API_KEY || '',
     };
+    this.models = { ...MODELS, ...(config?.models ?? {}) };
+  }
+
+  /** 当前生效的模型名（供查询接口展示） */
+  currentModels(): typeof MODELS {
+    return { ...this.models };
   }
 
   supports(cap: ProviderCapability): boolean {
@@ -69,7 +80,7 @@ export class AgnesProvider implements AIProvider {
     const host = this.config.baseUrl.replace(/\/v\d+\/?$/, '');
     const url =
       `${host}/agnesapi?video_id=${encodeURIComponent(taskId)}` +
-      `&model_name=${encodeURIComponent(MODELS.video)}`;
+      `&model_name=${encodeURIComponent(this.models.video)}`;
     const data = await this.request(url, {
       method: 'GET',
       timeoutMs: 30_000,
@@ -121,7 +132,7 @@ export class AgnesProvider implements AIProvider {
     const data = await this.request(`${this.config.baseUrl}/chat/completions`, {
       method: 'POST',
       body: {
-        model: req.model || MODELS.text,
+        model: req.model || this.models.text,
         messages: [
           { role: 'system', content: '你是AI漫剧提示词优化助手，输出简洁中文。' },
           { role: 'user', content: userContent },
@@ -161,7 +172,7 @@ export class AgnesProvider implements AIProvider {
       {
         method: 'POST',
         body: {
-          model: model || MODELS.image,
+          model: model || this.models.image,
           prompt: req.prompt,
           size,
           ratio,
@@ -204,7 +215,7 @@ export class AgnesProvider implements AIProvider {
     };
 
     const body: Record<string, any> = {
-      model: req.model || MODELS.video,
+      model: req.model || this.models.video,
       prompt: req.prompt,
       mode,
       seconds: String(seconds),

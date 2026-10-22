@@ -1,11 +1,19 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import { ArrowLeft, Check } from '@element-plus/icons-vue';
 import { dramaApi } from '@/api';
-import { DIALECT_MAP, COVER_STYLES } from '@/utils/dialect';
-import type { Drama, Episode } from '@/types';
+import {
+  DIALECT_MAP,
+  COVER_STYLES,
+  ASPECT_RATIOS,
+  FRAME_RATES,
+  RESOLUTIONS,
+  parseOutputSpec,
+  DEFAULT_OUTPUT_SPEC,
+} from '@/utils/dialect';
+import type { Drama, Episode, OutputSpec } from '@/types';
 
 const route = useRoute();
 const router = useRouter();
@@ -29,6 +37,16 @@ const form = reactive({
   description: '',
   dialect: 'standard',
   coverStyle: 'default',
+  // 成片规格：全流程共用（建项目时定，此处可改但需二次确认）
+  aspect_ratio: DEFAULT_OUTPUT_SPEC.aspect_ratio as string,
+  frame_rate: DEFAULT_OUTPUT_SPEC.frame_rate as number,
+  resolution: DEFAULT_OUTPUT_SPEC.resolution as string,
+});
+/** 已保存的规格，用于判断本次保存是否改动了画幅（改动会让已有素材全部失效） */
+const savedSpec = ref({
+  aspect_ratio: DEFAULT_OUTPUT_SPEC.aspect_ratio as string,
+  frame_rate: DEFAULT_OUTPUT_SPEC.frame_rate as number,
+  resolution: DEFAULT_OUTPUT_SPEC.resolution as string,
 });
 
 async function load() {
@@ -40,6 +58,11 @@ async function load() {
       form.description = project.value.description || '';
       form.dialect = project.value.dialect || 'standard';
       form.coverStyle = project.value.coverStyle || 'default';
+      const spec = parseOutputSpec(project.value.outputCfg);
+      form.aspect_ratio = spec.aspect_ratio;
+      form.frame_rate = spec.frame_rate;
+      form.resolution = spec.resolution;
+      savedSpec.value = { ...spec };
     }
     saved.value = false;
   } catch (e: any) {
@@ -58,6 +81,26 @@ async function save() {
     ElMessage.warning('请输入项目名称');
     return;
   }
+  // 画幅变更会让已生成的全部素材失效（它们是按旧画幅出图的），
+  // 必须让用户明确知情，避免「改一下比例」这种轻率操作毁掉整片素材。
+  const specChanged =
+    form.aspect_ratio !== savedSpec.value.aspect_ratio ||
+    form.resolution !== savedSpec.value.resolution ||
+    Number(form.frame_rate) !== Number(savedSpec.value.frame_rate);
+  if (specChanged && statEpisodes() > 0) {
+    try {
+      await ElMessageBox.confirm(
+        `成片规格从 ${savedSpec.value.aspect_ratio} · ${savedSpec.value.frame_rate}fps · ${savedSpec.value.resolution} ` +
+          `改为 ${form.aspect_ratio} · ${form.frame_rate}fps · ${form.resolution}。\n\n` +
+          `画幅/清晰度是生成参数：已生成的角色立绘、场景图、分镜首尾帧与视频都按旧规格出图，` +
+          `改规格后它们无法自动适配，必须重新生成全部素材，否则合成会拉伸或加黑边。\n\n确定继续？`,
+        '更改成片规格',
+        { type: 'warning', confirmButtonText: '更改并继续', cancelButtonText: '取消' },
+      );
+    } catch {
+      return;
+    }
+  }
   saving.value = true;
   try {
     project.value = await dramaApi.update(dramaId, {
@@ -65,9 +108,21 @@ async function save() {
       description: form.description,
       dialect: form.dialect,
       coverStyle: form.coverStyle,
+      outputCfg: {
+        aspect_ratio: form.aspect_ratio as OutputSpec['aspect_ratio'],
+        frame_rate: Number(form.frame_rate),
+        resolution: form.resolution as OutputSpec['resolution'],
+      },
     });
+    savedSpec.value = {
+      aspect_ratio: form.aspect_ratio,
+      frame_rate: Number(form.frame_rate),
+      resolution: form.resolution,
+    };
     saved.value = true;
-    ElMessage.success('项目已保存');
+    ElMessage.success(
+      specChanged ? '项目已保存；若已生成素材，请重新生成以匹配新的成片规格' : '项目已保存',
+    );
   } catch (e: any) {
     ElMessage.error(e.message);
   } finally {
@@ -136,6 +191,36 @@ onMounted(load);
                 <option v-for="c in COVER_STYLES" :key="c.value" :value="c.value">{{ c.label }}</option>
               </select>
             </div>
+            <!-- 成片规格：全流程共用的生成参数。改动会让已生成素材失效，故用醒目样式 + 保存时二次确认。 -->
+            <div class="spec-block">
+              <label class="lmd-label">
+                成片规格
+                <span class="lmd-hint-inline">生图 / 生视频 / 合成共用同一份</span>
+              </label>
+              <div class="spec-grid">
+                <div>
+                  <label class="lmd-label sm">画面比例</label>
+                  <select v-model="form.aspect_ratio" class="lmd-input">
+                    <option v-for="a in ASPECT_RATIOS" :key="a.value" :value="a.value">{{ a.label }}</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="lmd-label sm">帧率</label>
+                  <select v-model="form.frame_rate" class="lmd-input">
+                    <option v-for="f in FRAME_RATES" :key="f.value" :value="f.value">{{ f.label }}</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="lmd-label sm">输出清晰度</label>
+                  <select v-model="form.resolution" class="lmd-input">
+                    <option v-for="r in RESOLUTIONS" :key="r.value" :value="r.value">{{ r.label }}</option>
+                  </select>
+                </div>
+              </div>
+              <p class="lmd-range-hint">
+                画幅与清晰度是生成参数而非后期裁切参数：更改后必须重新生成全部素材，否则合成会拉伸或加黑边。
+              </p>
+            </div>
           </div>
         </div>
 
@@ -169,6 +254,26 @@ onMounted(load);
 </template>
 
 <style scoped>
+/* 成片规格块：这是不可逆决策（改后素材需全部重生成），需与普通表单项视觉区分 */
+.spec-block {
+  padding: 12px;
+  border: 1px solid rgba(99, 102, 241, 0.28);
+  border-radius: 8px;
+  background: rgba(99, 102, 241, 0.06);
+}
+.spec-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.spec-grid .lmd-label.sm { font-size: 12px; font-weight: 500; margin-bottom: 4px; }
+.lmd-hint-inline {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 400;
+  color: #a5b4fc;
+}
+
 .lmd-topbar {
   background: rgba(255, 255, 255, 0.92);
   border-bottom: 1px solid var(--border);

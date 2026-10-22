@@ -9,6 +9,18 @@
 import { stripAnchorMeta, dedupeStyleAnchor, PromptService } from '../src/ai/prompt.service';
 import { StorageService } from '../src/ai/storage.service';
 import { GenerateService, allocateFirstFrameRefs } from '../src/generate/generate.service';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { AppConfigService } from '../src/app-config/app-config.service';
+import { extractScriptExcerpt } from '../src/generate/script-parse.util';
+import {
+  parseOutputSpec,
+  imageRatioOf,
+  propRatioOf,
+  videoSizeOf,
+  resolutionOf,
+} from '../src/output-spec';
 
 const STYLE = { artStyle: 'cartoon' } as any;
 let fail = 0;
@@ -315,6 +327,166 @@ const mkRef = (kind: string, name: string) => ({ kind, name, uri: `uri:${name}` 
 // 兜底：cap=0 时不得返回任何参考图；空输入同样安全
 eq('alloc handles zero cap', allocateFirstFrameRefs([mkRef('character', 'A')], 0).refs.length, 0);
 eq('alloc empty input', allocateFirstFrameRefs([], 5).refs.length, 0);
+
+// ============ 场景/道具出图必须建立在「剧本 + 已生成角色 + 引用分镜」之上 ============
+// 需求：不能随意生成。以下覆盖「剧本摘录 → 提示词注入 → 参考图声明」整条链路。
+{
+  const script = [
+    '第一集 内景 老张家客厅 日',
+    '这是一间低矮的土坯房，墙上糊着发黄的报纸。',
+    '蛋蛋从里屋拿出一个掉漆的铁皮青蛙。',
+    '老爸接过铁皮青蛙，拇指按住发条。',
+    '屋外传来几声狗叫，院里停着二八大杠。',
+    '院墙根还堆着两捆发黄的麦秸。',
+  ].join('\n');
+
+  // 摘录：命中行 + 前后各 1 句邻居，超出范围的无关行不取
+  const sceneExcerpt = extractScriptExcerpt(script, ['客厅'], { maxChars: 400 });
+  eq('excerpt hits scene location', sceneExcerpt.includes('土坯房'), true);
+  eq('excerpt stops at neighbour window', sceneExcerpt.includes('铁皮青蛙'), false);
+  eq('excerpt drops far line', sceneExcerpt.includes('麦秸'), false);
+
+  const wideExcerpt = extractScriptExcerpt(script, ['客厅', '铁皮青蛙'], { maxChars: 400 });
+  eq('excerpt unions multiple keywords', wideExcerpt.includes('二八大杠'), true);
+
+  const propExcerpt = extractScriptExcerpt(script, ['铁皮青蛙'], { maxChars: 400 });
+  eq('excerpt hits prop name', propExcerpt.includes('掉漆'), true);
+
+  eq('excerpt empty when no hit', extractScriptExcerpt(script, ['火星基地']).length, 0);
+  eq('excerpt empty when no script', extractScriptExcerpt(null, ['客厅']).length, 0);
+  eq('excerpt ignores 1-char keyword', extractScriptExcerpt(script, ['的']).length, 0);
+  eq('excerpt capped by maxChars',
+    extractScriptExcerpt(script, ['客厅', '客厅', '客厅'], { maxChars: 10 }).length <= 10, true);
+
+  // 场景提示词：必须带上剧本依据、分镜画面、角色锚点、参考图声明
+  const scenePrompt = svc.sceneImagePrompt(
+    { location: '老张家客厅', time: '日', description: '低矮土坯房' },
+    false,
+    STYLE,
+    '「蛋蛋」=人物、「老爸」=人物',
+    {
+      scriptExcerpt: sceneExcerpt,
+      shotLines: ['分镜#1：客厅正面全景，蛋蛋蹲在门槛上'],
+      charAnchors: ['「蛋蛋」圆脸，棕色卷发，穿黄色T恤'],
+      refNames: ['用户上传的参考图'],
+    },
+  );
+  eq('scene prompt carries script basis', scenePrompt.includes('剧本依据'), true);
+  eq('scene prompt carries script text', scenePrompt.includes('土坯房'), true);
+  eq('scene prompt carries shot usage', scenePrompt.includes('分镜#1'), true);
+  eq('scene prompt carries char anchor', scenePrompt.includes('黄色T恤'), true);
+  eq('scene prompt declares refs 1-based', scenePrompt.includes('图1=用户上传的参考图'), true);
+  eq('scene prompt forbids人物', scenePrompt.includes('绝不出现人物'), true);
+  eq('scene prompt forbids free invention', scenePrompt.includes('禁止与之矛盾或自由发挥'), true);
+  eq('scene prompt still no meta tag', /【风格:/.test(scenePrompt), false);
+
+  // 道具提示词：必须带上所在环境（年代/材质/色调对齐）
+  const propPrompt = svc.propImagePrompt(
+    { name: '铁皮青蛙', type: '玩具', description: '掉漆的绿色铁皮青蛙' },
+    false,
+    STYLE,
+    '「蛋蛋」=人物',
+    {
+      scriptExcerpt: propExcerpt,
+      relatedScene: '老张家客厅（日）：低矮的土坯房',
+      shotLines: ['分镜#2：手部特写，拇指按住发条'],
+      charAnchors: ['「蛋蛋」黄色T恤'],
+      refNames: ['场景图「老张家客厅」（仅用于对齐年代/材质/色调，不是要画的场景）'],
+    },
+  );
+  eq('prop prompt carries script basis', propPrompt.includes('掉漆'), true);
+  eq('prop prompt carries related scene', propPrompt.includes('土坯房'), true);
+  eq('prop prompt aligns material with scene', propPrompt.includes('同材质'), true);
+  eq('prop prompt declares scene ref not subject', propPrompt.includes('图1=场景图'), true);
+
+  // 无上下文时不得凭空编造依据段（退化为仅有消歧串的旧行为）
+  const bare = svc.sceneImagePrompt({ location: '客厅' }, false, STYLE, '「蛋蛋」=人物');
+  eq('bare prompt has no fake script basis', bare.includes('剧本依据'), false);
+  eq('bare prompt has no fake ref block', bare.includes('参考图对应关系'), false);
+}
+
+// ============ 成片规格：建项目时定，全流程唯一真相源 ============
+// 回归重点：生图/生视频画幅必须跟随项目规格，不能再硬编码 9:16，
+// 否则「建项目选 16:9」只会在最后合成才生效，前面素材全是竖屏。
+{
+  eq('spec default is 9:16', parseOutputSpec(null).aspect_ratio, '9:16');
+  eq('spec parses json string',
+    parseOutputSpec('{"aspect_ratio":"16:9","frame_rate":24,"resolution":"720p"}'),
+    { aspect_ratio: '16:9', frame_rate: 24, resolution: '720p' });
+  eq('spec survives malformed json', parseOutputSpec('{oops').aspect_ratio, '9:16');
+  eq('spec rejects bad ratio', parseOutputSpec({ aspect_ratio: '4:3' }).aspect_ratio, '9:16');
+  eq('spec rejects bad fps', parseOutputSpec({ frame_rate: 999 }).frame_rate, 30);
+  eq('spec rejects bad resolution', parseOutputSpec({ resolution: '4K' }).resolution, '1080p');
+
+  const portrait = parseOutputSpec({ aspect_ratio: '9:16', resolution: '1080p' });
+  const landscape = parseOutputSpec({ aspect_ratio: '16:9', resolution: '1080p' });
+  // 画面内容类素材必须与成片画幅一致
+  eq('image ratio follows spec portrait', imageRatioOf(portrait), '9:16');
+  eq('image ratio follows spec landscape', imageRatioOf(landscape), '16:9');
+  // 道具设定图恒 1:1（与画幅无关的设定图语义）
+  eq('prop ratio stays 1:1', propRatioOf(landscape), '1:1');
+  // 视频请求固定 720P（模型只有该档），最终分辨率由合成 upscale
+  eq('video size stays 720P', videoSizeOf(landscape), '720P');
+
+  eq('resolution 9:16 1080p', resolutionOf(portrait), [1080, 1920]);
+  eq('resolution 16:9 1080p', resolutionOf(landscape), [1920, 1080]);
+  eq('resolution 16:9 720p', resolutionOf({ ...landscape, resolution: '720p' }), [1280, 720]);
+}
+
+// ============ 全局配置：调度 + AI 合一 ============
+// 回归重点：① 明文 Key 绝不能回传前端；② 前端回传脱敏串时不能把真 Key 冲掉。
+{
+  const root = path.join(os.tmpdir(), `lmd-cfg-${Date.now()}`);
+  // AppConfigService 写 cwd/../data，所以必须 chdir 到一个「子目录」里，
+  // 否则会写到共享的临时目录根下、被上一次运行的残留污染
+  const dir = path.join(root, 'app');
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.mkdirSync(dir, { recursive: true });
+  const cwd = process.cwd();
+  process.chdir(dir);
+  try {
+    const cfg = new AppConfigService();
+    const realKey = 'sk-REALSECRET-1234567890';
+    cfg.setAiConfigFromDisplay({
+      defaultProvider: 'agnes',
+      providers: { agnes: { apiKey: realKey, baseUrl: 'https://x/v1', models: { image: 'custom-image-model' } } },
+      tts: { appId: 'app-1', token: 'tok-1', cluster: 'volcano_tts', defaultVoice: '' },
+    });
+
+    // 读取必须是脱敏的
+    const shown: any = cfg.getAiConfigForDisplay();
+    const shownKey = shown.providers.agnes.apiKey;
+    eq('config never leaks raw key', shownKey.includes(realKey), false);
+    eq('config masks key', shownKey.includes('****'), true);
+    eq('config flags key as set', shown.providers.agnes.apiKeySet, true);
+    eq('config masks tts token', shown.tts.token.includes('****'), true);
+    eq('config exposes baseUrl', shown.providers.agnes.baseUrl, 'https://x/v1');
+    // 自定义模型必须透传（未提交的能力回落默认）
+    eq('config keeps custom model', shown.providers.agnes.models.image, 'custom-image-model');
+    eq('config fills default models', shown.providers.agnes.models.text, 'agnes-2.5-flash');
+
+    // 前端把脱敏串原样回传 → 真 Key 不能被覆盖
+    cfg.setAiConfigFromDisplay(shown);
+    eq('masked roundtrip keeps real key', cfg.getAiConfig().providers.agnes.apiKey, realKey);
+    eq('masked roundtrip keeps model', cfg.getAiConfig().providers.agnes.models.image, 'custom-image-model');
+
+    // 填了新 Key → 真正替换
+    cfg.setAiConfigFromDisplay({ providers: { agnes: { apiKey: 'sk-NEW-999' } } });
+    eq('new key replaces old', cfg.getAiConfig().providers.agnes.apiKey, 'sk-NEW-999');
+    // 只改模型不影响 Key
+    cfg.setAiConfigFromDisplay({ providers: { agnes: { models: { text: 'other-text' } } } });
+    eq('model change keeps key', cfg.getAiConfig().providers.agnes.apiKey, 'sk-NEW-999');
+    eq('model change applied', cfg.getAiConfig().providers.agnes.models.text, 'other-text');
+
+    // 调度配置
+    cfg.setScheduler({ max_image_concurrency: 7 });
+    eq('scheduler persists', cfg.getScheduler().max_image_concurrency, 7);
+    eq('scheduler keeps other defaults', cfg.getScheduler().max_video_concurrency, 2);
+  } finally {
+    process.chdir(cwd);
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
 
 auditTests().then(() => {
   console.log(fail === 0 ? '\nALL PASS' : `\n${fail} FAILED`);

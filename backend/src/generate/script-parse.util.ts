@@ -85,6 +85,62 @@ export function splitScriptChunks(script: string): string[] {
   return chunks.filter((c) => c.trim());
 }
 
+/**
+ * 从剧本原文里摘取与某个素材（场景地点 / 道具名）相关的片段。
+ *
+ * 背景：场景图与道具图此前只靠自身 description 生成，等于「自由发挥」——
+ * 剧本里写明的年代、地点、道具归属与用途全部丢失，出图与剧情脱节。
+ * 这里把剧本中命中关键词的句子连同前后各 1 句邻居取出，作为生图的事实依据。
+ *
+ * 纯函数（无 IO），命中为空时返回空串，调用方据此提示「缺少剧本依据」。
+ */
+export function extractScriptExcerpt(
+  script: string | null | undefined,
+  keywords: Array<string | null | undefined>,
+  opts: { maxChars?: number; neighbors?: number } = {},
+): string {
+  const maxChars = opts.maxChars ?? 400;
+  const neighbors = opts.neighbors ?? 1;
+  const text = (script || '').trim();
+  if (!text || !keywords.length) return '';
+
+  const keys = keywords
+    .map((k) => (k || '').replace(/[\s·・．,，。、]/g, ''))
+    .filter((k) => k.length >= 2);
+  if (!keys.length) return '';
+
+  // 按换行断句（剧本一行一句），保留原顺序与行号，便于回看
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) return '';
+
+  const norm = (s: string) => s.replace(/[\s·・．,，。、]/g, '');
+  const hit = lines.map((l) => {
+    const n = norm(l);
+    return keys.some((k) => n.includes(k));
+  });
+  if (!hit.some(Boolean)) return '';
+
+  const picked = new Set<number>();
+  hit.forEach((h, i) => {
+    if (!h) return;
+    for (let d = -neighbors; d <= neighbors; d++) {
+      const j = i + d;
+      if (j >= 0 && j < lines.length) picked.add(j);
+    }
+  });
+
+  const kept = [...picked].sort((a, b) => a - b).map((i) => lines[i]);
+  const out: string[] = [];
+  let used = 0;
+  for (const line of kept) {
+    const add = out.length ? ` ${line}` : line;
+    if (used + add.length > maxChars) break;
+    out.push(add);
+    used += add.length;
+  }
+  return out.join('').trim();
+}
+
 /** 合并多段拆解结果：角色/场景/道具按名称去重，分镜按顺序拼接 */
 export function mergeParsed(parts: ParsedScript[]): ParsedScript {
   const out: ParsedScript = { characters: [], scenes: [], props: [], storyboards: [] };

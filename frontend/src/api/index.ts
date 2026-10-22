@@ -1,5 +1,14 @@
 import axios from 'axios';
-import type { Drama, Episode, SchedulerConfig, AiConfig, Character, Scene, Prop, Storyboard, MergeConfig } from '@/types';
+import type { Drama, Episode, SchedulerConfig, AiConfig, GlobalSettings, Character, Scene, Prop, Storyboard, MergeConfig, OutputSpec } from '@/types';
+
+/** 项目写入载荷：outputCfg 为结构化对象（与后端 DTO 一致） */
+export type DramaWriteDto = {
+  title: string;
+  description?: string;
+  dialect?: string;
+  coverStyle?: string;
+  outputCfg?: OutputSpec;
+};
 
 // 统一走 Vite 代理：/api -> 后端 5679
 const http = axios.create({ baseURL: '/api', timeout: 60000 });
@@ -16,8 +25,10 @@ http.interceptors.response.use(
 export const dramaApi = {
   list: () => http.get<Drama[]>('/dramas').then((r) => r.data),
   get: (id: number) => http.get<Drama>(`/dramas/${id}`).then((r) => r.data),
-  create: (data: Partial<Drama>) => http.post<Drama>('/dramas', data).then((r) => r.data),
-  update: (id: number, data: Partial<Drama>) => http.put<Drama>(`/dramas/${id}`, data).then((r) => r.data),
+  // 创建/更新时 outputCfg 传结构化对象（后端 DTO 是对象，落库时才序列化成 JSON 字符串），
+  // 故不能用 Partial<Drama>（那里 outputCfg 是读取用的 string）
+  create: (data: DramaWriteDto) => http.post<Drama>('/dramas', data).then((r) => r.data),
+  update: (id: number, data: DramaWriteDto) => http.put<Drama>(`/dramas/${id}`, data).then((r) => r.data),
   remove: (id: number) => http.delete(`/dramas/${id}`).then((r) => r.data),
 };
 
@@ -39,6 +50,11 @@ export const episodeApi = {
 
 // ===== 配置 =====
 export const configApi = {
+  // 合并后的全局设置：调度 + AI 一次读写，前端只需一个弹窗
+  getSettings: () => http.get<GlobalSettings>('/settings').then((r) => r.data),
+  setSettings: (data: Partial<GlobalSettings>) =>
+    http.put<GlobalSettings>('/settings', data).then((r) => r.data),
+  // 以下保留兼容旧调用点
   getScheduler: () => http.get<SchedulerConfig>('/scheduler-config').then((r) => r.data),
   setScheduler: (data: Partial<SchedulerConfig>) => http.put<SchedulerConfig>('/scheduler-config', data).then((r) => r.data),
   getAi: () => http.get<AiConfig>('/ai-config').then((r) => r.data),

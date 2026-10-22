@@ -14,6 +14,8 @@ import {
   CreateStoryboardDto,
   UpdateStoryboardDto,
 } from './dto/script.dto';
+// 时长自动校准的唯一实现（与剧本拆解共用同一套语速/夹取规则）
+import { normDuration } from '../generate/script-parse.util';
 
 @Injectable()
 export class ScriptService {
@@ -364,7 +366,8 @@ export class ScriptService {
         sceneDescription: dto.sceneDescription ?? null,
         motionDescription: dto.motionDescription ?? null,
         emotion: dto.emotion ?? 'neutral',
-        duration: dto.duration ?? 5,
+        // 时长自动校准：不必由用户点按钮，按台词实际长度兜底
+        duration: normDuration(dto.duration, dto.dialogue, dto.narration),
         dialect: dto.dialect ?? null,
         referenceImageUrl: dto.referenceImageUrl ?? null,
         status: dto.status ?? 'pending',
@@ -395,7 +398,6 @@ export class ScriptService {
     if (dto.motionDescription !== undefined)
       data.motionDescription = dto.motionDescription;
     if (dto.emotion !== undefined) data.emotion = dto.emotion;
-    if (dto.duration !== undefined) data.duration = dto.duration;
     if (dto.dialect !== undefined) data.dialect = dto.dialect;
     if (dto.imageUrl !== undefined) data.imageUrl = dto.imageUrl;
     if (dto.lastFrameUrl !== undefined) data.lastFrameUrl = dto.lastFrameUrl;
@@ -405,6 +407,19 @@ export class ScriptService {
     if (dto.imagePrompt !== undefined) data.imagePrompt = dto.imagePrompt;
     if (dto.videoPrompt !== undefined) data.videoPrompt = dto.videoPrompt;
     if (dto.status !== undefined) data.status = dto.status;
+
+    // 时长自动校准（每次保存都跑，含只改台词的情况）：
+    // 台词/旁白一旦变动，就可能超出当前时长导致配音被截断。这里以「台词/旁白的
+    // 实际可朗读长度」为准取下限，用户显式填的更长值保留（情绪镜需要留白），
+    // 因此无需再暴露「校准时长」按钮 —— 该按钮此前只是绕过这个缺口。
+    {
+      const dialogue = dto.dialogue !== undefined ? dto.dialogue : exist.dialogue;
+      const narration = dto.narration !== undefined ? dto.narration : exist.narration;
+      const wanted =
+        dto.duration !== undefined ? dto.duration : (exist.duration ?? 5);
+      data.duration = normDuration(wanted, dialogue, narration);
+    }
+
     const updated = await this.prisma.storyboard.update({ where: { id }, data });
     return {
       ...updated,

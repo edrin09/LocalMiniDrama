@@ -181,6 +181,62 @@ export function singingConstraint(style?: GenStyle): string {
   return '禁止唱歌、禁止哼唱、禁止演唱、禁止配乐歌词，画面人物不得歌唱';
 }
 
+/**
+ * 素材（场景/道具）出图时的「关联上下文」。
+ *
+ * 缺了它，场景/道具就只能靠一行 description 自由发挥 —— 与剧本无关、
+ * 与已生成的角色形象无关，同一地点多次出图色调也会漂。
+ */
+export interface AssetContext {
+  /** 剧本原文中与该素材相关的片段（事实依据） */
+  scriptExcerpt?: string | null;
+  /** 该素材被哪些分镜引用，这些分镜的画面描述（用途/机位/氛围约束） */
+  shotLines?: string[];
+  /** 关联角色的形象锚点（服装主色等，供色调/时代感对齐，不入画人物） */
+  charAnchors?: string[];
+  /** 关联场景名与描述（道具图用，锁定所处的环境） */
+  relatedScene?: string | null;
+  /** 随请求附上的参考图名称（顺序即注入顺序，1-based） */
+  refNames?: string[];
+}
+
+/**
+ * 把关联上下文渲染成提示词片段。
+ * 关键约束措辞：
+ * - 剧本片段是「事实依据」，禁止与之矛盾（防自由发挥）；
+ * - 角色锚点只用于对齐时代/色调/材质，明确「不得把人物画进素材图」；
+ * - 参考图按 1-based 声明对应关系（Agnes 约定第一个图 = 主体）。
+ */
+function assetContextText(ctx: AssetContext | undefined, kind: 'scene' | 'prop'): string {
+  if (!ctx) return '';
+  const parts: string[] = [];
+
+  if (ctx.scriptExcerpt?.trim()) {
+    parts.push(
+      `。剧本依据（必须严格贴合，禁止与之矛盾或自由发挥）：${ctx.scriptExcerpt.trim()}`,
+    );
+  }
+  if (ctx.relatedScene?.trim()) {
+    parts.push(`。该素材所在环境（场景图/道具需与之同年代、同材质、同色调）：${ctx.relatedScene.trim()}`);
+  }
+  if (ctx.shotLines?.length) {
+    parts.push(
+      `。分镜中的实际用法（画面要素以此为准）：${ctx.shotLines.slice(0, 6).join('；')}`,
+    );
+  }
+  if (ctx.charAnchors?.length) {
+    parts.push(
+      `。本剧关联角色的既有形象设定（仅用于对齐年代感、色调与材质，${kind === 'scene' ? '本图为纯场景图' : '本图为纯道具图'}，绝不出现人物）：${ctx.charAnchors.slice(0, 4).join('；')}`,
+    );
+  }
+  if (ctx.refNames?.length) {
+    parts.push(
+      `。参考图对应关系：${ctx.refNames.map((n, i) => `图${i + 1}=${n}`).join('、')}，仅按此对应关系理解，禁止混用`,
+    );
+  }
+  return parts.join('');
+}
+
 /** 首帧一致性自动审核结果 */
 export interface FirstFrameAudit {
   pass: boolean;
@@ -271,6 +327,7 @@ export class PromptService {
     quad: boolean,
     style?: GenStyle,
     charCtx?: string,
+    ctx?: AssetContext,
   ): string {
     const body = [
       s.prompt?.trim(),
@@ -283,7 +340,7 @@ export class PromptService {
     const disamb = charCtx
       ? `。以下是本剧角色的人名/昵称（仅用于指代人物，不是物体名词，绝不可把它们画成鸡蛋/物件等同名实物）：${charCtx}`
       : '';
-    const base = `${styleAnchorOf(style)}，场景概念图，${body}${disamb}，电影级构图，环境光自然，高视觉密度，画面中不出现任何文字、水印`;
+    const base = `${styleAnchorOf(style)}，场景概念图，${body}${disamb}${assetContextText(ctx, 'scene')}，电影级构图，环境光自然，高视觉密度，画面中不出现任何文字、水印`;
     if (!quad) return `${base}，单张完整场景图，无人物或仅远景小人物`;
     return (
       `${base}，四宫格分镜参考图：2x2 排列，四个格子分别为同一场景的正面平视、侧面平视、俯视、仰视四个视角，` +
@@ -291,7 +348,13 @@ export class PromptService {
     );
   }
 
-  propImagePrompt(p: PropLike, quad: boolean, style?: GenStyle, charCtx?: string): string {
+  propImagePrompt(
+    p: PropLike,
+    quad: boolean,
+    style?: GenStyle,
+    charCtx?: string,
+    ctx?: AssetContext,
+  ): string {
     const body = [p.prompt?.trim(), p.description?.trim(), `${p.name}${p.type ? `（${p.type}）` : ''}`]
       .filter(Boolean)
       .join('；');
@@ -299,7 +362,7 @@ export class PromptService {
     const disamb = charCtx
       ? `。注意：以下本剧角色的人名/昵称是人物，不是实物（如「蛋蛋」是人不是鸡蛋），道具设定图若含上述字词一律按人物处理，不得画成同名物体：${charCtx}`
       : '';
-    const base = `${styleAnchorOf(style)}，道具设定图，${body}${disamb}，纯色无缝背景，主体居中，清晰轮廓，高细节，画面中不出现任何文字、水印`;
+    const base = `${styleAnchorOf(style)}，道具设定图，${body}${disamb}${assetContextText(ctx, 'prop')}，纯色无缝背景，主体居中，清晰轮廓，高细节，画面中不出现任何文字、水印`;
     if (!quad) return base;
     return (
       `${base}，四视图道具图：2x2 排列，分别为正面、侧面、背面、45度斜视角四个视图，` +

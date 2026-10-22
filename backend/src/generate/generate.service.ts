@@ -12,7 +12,17 @@ import { AIProviderFactory } from '../ai/ai-provider.factory';
 import { RateLimitService } from '../ai/rate-limit.service';
 import { StorageService, StoredAsset } from '../ai/storage.service';
 import { PromptService } from '../ai/prompt.service';
-import { GenStyle, anchorStyleTag } from '../ai/prompt.service';
+import { GenStyle, anchorStyleTag, AssetContext } from '../ai/prompt.service';
+// 成片规格（画幅/帧率/清晰度）：全流程唯一真相源，建项目时定
+import {
+  DEFAULT_OUTPUT_SPEC,
+  parseOutputSpec,
+  imageRatioOf,
+  propRatioOf,
+  videoSizeOf,
+  resolutionOf,
+  type OutputSpec,
+} from '../output-spec';
 import { FfmpegService } from '../ai/ffmpeg.service';
 import { ProviderAuthError, ProviderTransientError } from '../ai/provider.types';
 // 剧本拆解的纯逻辑已抽离到 script-parse.util.ts（无 IO，可单测）
@@ -27,6 +37,7 @@ import {
   normDuration,
   normalizeNameKey,
   locTimeKey,
+  extractScriptExcerpt,
   matchName,
   normalizeParsedScript,
 } from './script-parse.util';
@@ -76,6 +87,7 @@ export interface GenerateEpisodeOpts {
 /** v2.5-flash 单段视频仅支持 4–12 秒 */
 const clampSeconds = (duration?: number | null) =>
   String(Math.min(12, Math.max(4, Math.round(duration ?? 5))));
+
 
 /**
  * 首帧 VLM 自动质检的最大生成次数（含首次）。
@@ -252,6 +264,8 @@ export class GenerateService {
 
   private async runCharacter(c: any, episodeId: number, style?: GenStyle) {
     const tag = `角色「${c.name}」`;
+    // 立绘画幅跟随项目成片规格（此前硬编码 9:16，横屏项目会被拉伸）
+    const spec = await this.resolveOutputSpecOfDrama(c.dramaId);
 
     // 先提炼视觉锚点（跨分镜一致性基础）；
     // 锚点内嵌风格标记，切换画面风格后会自动重提炼
@@ -275,7 +289,7 @@ export class GenerateService {
       label: `${tag} 形象`,
       prompt: this.prompt.characterImagePrompt({ ...c, anchors }, style),
       filename: `char-${c.id}-${Date.now()}.png`,
-      ratio: '9:16',
+      ratio: imageRatioOf(spec),
     });
     if (asset) {
       const oldUrl = c.imageUrl;
@@ -339,13 +353,23 @@ export class GenerateService {
     const quad = false;
     const tag = `场景「${s.location}」（单图）`;
     const charCtx = await this.roleNameContext(s.episode.dramaId);
+    // 关联上下文：剧本原文片段 + 引用本场景的分镜画面 + 关联角色的既有形象锚点。
+    // 没有它，场景图只能靠一行 description 自由发挥，会与剧本、与已生成角色各画各的。
+    const ctx = await this.sceneAssetContext(s, style);
+    const refs = await this.sceneRefImages(s);
+    // 场景图必须与成片画幅一致，否则注入首帧后会被缩放变形
+    const spec = await this.resolveOutputSpec(s.episodeId);
     const asset = await this.image({
       episodeId: s.episodeId,
       dramaId: s.episode.dramaId,
       label: tag,
-      prompt: this.prompt.sceneImagePrompt(s, quad, style, charCtx),
+      prompt: this.prompt.sceneImagePrompt(s, quad, style, charCtx, {
+        ...ctx,
+        refNames: refs.names,
+      }),
       filename: `scene-${s.id}-${quad ? 'quad' : 'single'}-${Date.now()}.png`,
-      ratio: '9:16',
+      ratio: imageRatioOf(spec),
+      images: refs.images,
     });
     if (asset) {
       const oldUrl = s.imageUrl;
@@ -391,13 +415,21 @@ export class GenerateService {
     const quad = false;
     const tag = `道具「${p.name}」（单图）`;
     const charCtx = await this.roleNameContext(p.episode.dramaId);
+    const ctx = await this.propAssetContext(p, style);
+    const refs = await this.propRefImages(p);
+    // 道具设定图恒为 1:1：它是与画幅无关的设定图，塞进任何画幅都靠缩放而非裁切
+    const spec = await this.resolveOutputSpec(p.episodeId);
     const asset = await this.image({
       episodeId: p.episodeId,
       dramaId: p.episode.dramaId,
       label: tag,
-      prompt: this.prompt.propImagePrompt(p, quad, style, charCtx),
+      prompt: this.prompt.propImagePrompt(p, quad, style, charCtx, {
+        ...ctx,
+        refNames: refs.names,
+      }),
       filename: `prop-${p.id}-${quad ? 'quad' : 'single'}-${Date.now()}.png`,
-      ratio: '1:1',
+      ratio: propRatioOf(spec),
+      images: refs.images,
     });
     if (asset) {
       const oldUrl = p.imageUrl;
@@ -483,6 +515,9 @@ export class GenerateService {
     // 记录被替换前的旧文件，新文件落库后物理删除，避免重生成堆积孤儿
     const oldFirst = sb.imageUrl;
     const oldTail = sb.lastFrameUrl;
+    // 首帧/尾帧是「真正的画面内容」，画幅必须与成片一致：
+    // 9:16 素材塞进 16:9 成片会被压成窄条或加黑边。
+    const spec = await this.resolveOutputSpec(sb.episodeId);
 
     const ctx = {
       sb,
@@ -633,7 +668,7 @@ export class GenerateService {
           label: `[分镜#${sb.number}] 首帧`,
           prompt: attemptPrompt,
           filename: `sb-${sb.number}-first-${Date.now()}.png`,
-          ratio: '9:16',
+          ratio: imageRatioOf(spec),
           images: refImages,
         });
         if (!first?.abs) break;
@@ -712,7 +747,7 @@ export class GenerateService {
         label: `[分镜#${sb.number}] 尾帧`,
         prompt: this.prompt.storyboardLastFramePrompt(ctx, style),
         filename: `sb-${sb.number}-last-${Date.now()}.png`,
-        ratio: '9:16',
+        ratio: imageRatioOf(spec),
         images: [firstRef],
       });
       if (tail) {
@@ -819,6 +854,8 @@ export class GenerateService {
 
     const seconds = clampSeconds(sb.duration);
     const provider = this.factory.resolve('video');
+    // 视频画幅同样跟随项目成片规格：视频是首帧的延续，画幅不一致会导致画面被拉伸
+    const spec = await this.resolveOutputSpec(sb.episodeId);
     const retryLogger = (attempt: number, delay: number, reason: string) =>
       this.log(
         sb.episodeId,
@@ -834,8 +871,8 @@ export class GenerateService {
               prompt,
               options: {
                 seconds,
-                size: '720P',
-                aspectRatio: '9:16',
+                size: videoSizeOf(spec),
+                aspectRatio: imageRatioOf(spec),
                 n: 1,
                 ...opts,
               },
@@ -1515,7 +1552,7 @@ export class GenerateService {
           where: { id: episodeId, deletedAt: null },
         });
         if (sbs.length > 0 && episode) {
-          const mergeCfg = this.parseMergeCfg(episode.mergeCfg);
+          const mergeCfg = await this.effectiveMergeCfg(episodeId, episode.mergeCfg);
           await this.runMerge(episode, mergeCfg, sbs);
         }
       }
@@ -1607,10 +1644,11 @@ export class GenerateService {
       throw new ForbiddenException('无可合成的分镜，先完成分镜生成');
     }
 
-    const mergeCfg = this.parseMergeCfg(episode.mergeCfg, cfg);
+    const mergeCfg = await this.effectiveMergeCfg(episodeId, episode.mergeCfg, cfg);
+    // 落库的只保留合成专属开关；画幅/帧率/清晰度由项目规格统一决定，不重复存一份
     await this.prisma.episode.update({
       where: { id: episodeId },
-      data: { mergeCfg: JSON.stringify(mergeCfg) },
+      data: { mergeCfg: JSON.stringify(this.parseMergeCfg(episode.mergeCfg, cfg)) },
     });
 
     this.fire(episodeId, 'episode', () => this.runMerge(episode, mergeCfg, sbs));
@@ -1631,14 +1669,25 @@ export class GenerateService {
       burn_dialogue_audio: true,
       burn_narration_subtitles: true,
       keep_original_audio: false,
-      aspect_ratio: '9:16',
-      frame_rate: 30,
-      resolution: '1080p',
       // AI 视频偶发像素被旋转 90°，开启后自动抽首帧与参考图对比校正
       auto_correct_rotation: true,
       ...base,
       ...(override ?? {}),
     };
+  }
+
+  /**
+   * 合成的画幅 / 帧率 / 清晰度一律以项目规格为准，不接受调用方覆盖。
+   *
+   * 合成是整条流水线的最后一步，到这里再决定画幅已经太晚了：
+   * 素材早就按各自的画幅生成完毕，此时「改画幅」只能靠缩放/黑边硬凑，
+   * 必然变形。因此这三个字段只能在这里被「读」，不能被「设」。
+   * 合成专属的开关（字幕 / 原声 / 旋转校正）仍由 mergeCfg 控制。
+   */
+  private async effectiveMergeCfg(episodeId: number, saved?: string | null, override: any = {}) {
+    const cfg = this.parseMergeCfg(saved, override);
+    const spec = await this.resolveOutputSpec(episodeId);
+    return { ...cfg, ...spec };
   }
 
   // ==================== 重置（物理删除生成素材，保留文本） ====================
@@ -2335,8 +2384,9 @@ export class GenerateService {
   ) {
     const episodeId = episode.id;
     const { dramaId } = episode;
-    const [tw, th] = this.resolutionOf(cfg);
-    const fps = Number(cfg.frame_rate) || 30;
+    // 合成只「读取」项目规格（effectiveMergeCfg 已把 spec 覆盖进 cfg），不再自己决定
+    const [tw, th] = resolutionOf(parseOutputSpec(cfg));
+    const fps = Number(cfg.frame_rate) || DEFAULT_OUTPUT_SPEC.frame_rate;
     const autoCorrect = cfg.auto_correct_rotation !== false; // 默认 true
 
     if (!(await this.ffmpeg.isAvailable())) {
@@ -2462,23 +2512,6 @@ export class GenerateService {
       `✅ 合成完成，成片 ${out.url}（${tw}x${th} @${fps}fps，声轨完整）`,
     );
   }
-
-  /** resolution 文本 → 像素尺寸（保持画面比例） */
-  private resolutionOf(cfg: any): [number, number] {
-    const ratio = String(cfg.aspect_ratio || '9:16');
-    const [rw, rh] = ratio.split(':').map(Number);
-    const is1080 = /1080/.test(String(cfg.resolution || '1080p'));
-    const longSide = is1080 ? 1080 : 720;
-    if (rw >= rh) {
-      const w = Math.min(longSide, Math.round((longSide * rw) / rh / 2) * 2);
-      const h = Math.round((w * rh) / rw / 2) * 2;
-      return [w, h];
-    }
-    const h = Math.min(longSide, Math.round((longSide * rh) / rw / 2) * 2);
-    const w = Math.round((h * rw) / rh / 2) * 2;
-    return [w, h];
-  }
-
 
   // ==================== 底层能力 ====================
 
@@ -2651,6 +2684,220 @@ export class GenerateService {
     return ctx;
   }
 
+  // ==================== 素材（场景/道具）的关联上下文 ====================
+  //
+  // 需求：场景/道具出图必须建立在「剧本原文 + 已生成角色 + 引用它的分镜」之上，
+  // 不能只凭一行 description 让模型自由发挥，否则素材与剧情、与其他素材各画各的。
+  // 三个来源：
+  //   ① 剧本原文（episode.scriptText）里命中该素材的片段 —— 事实依据；
+  //   ② 引用该素材的分镜的画面/动作描述 —— 用途与氛围约束；
+  //   ③ 这些分镜里出场角色的既有视觉锚点 —— 年代/色调/材质对齐。
+
+  /** 引用指定场景的分镜（用于取画面描述与出场角色） */
+  private shotsOfScene(sceneId: number) {
+    return this.prisma.storyboard.findMany({
+      where: { sceneId, deletedAt: null },
+      orderBy: { number: 'asc' },
+      select: {
+        number: true,
+        sceneDescription: true,
+        motionDescription: true,
+        dialogue: true,
+        characterId: true,
+        characterIds: true,
+      },
+    });
+  }
+
+  /**
+   * 引用指定道具的分镜。
+   * 多选道具存在 propIds JSON 里，Prisma 无法直接按 JSON 命中，只能取本集全量再回退解析。
+   */
+  private async shotsOfProp(episodeId: number, propId: number) {
+    const all = await this.prisma.storyboard.findMany({
+      where: { episodeId, deletedAt: null },
+      orderBy: { number: 'asc' },
+      select: {
+        number: true,
+        sceneDescription: true,
+        motionDescription: true,
+        dialogue: true,
+        characterId: true,
+        characterIds: true,
+        sceneId: true,
+        propId: true,
+        propIds: true,
+      },
+    });
+    return all.filter((sb) => this.parseIds(sb.propIds, sb.propId).includes(propId));
+  }
+
+  /** 分镜列表 → 提示词用的「画面要素」条目 + 出场角色 id（去重、保序） */
+  private shotContextLines(
+    shots: Array<{
+      number: number;
+      sceneDescription?: string | null;
+      motionDescription?: string | null;
+      characterId?: number | null;
+      characterIds?: string | null;
+    }>,
+  ): { lines: string[]; characterIds: number[] } {
+    const lines: string[] = [];
+    const ids: number[] = [];
+    const seen = new Set<number>();
+    for (const sb of shots) {
+      const parts = [(sb.sceneDescription || '').trim(), (sb.motionDescription || '').trim()]
+        .filter(Boolean)
+        .join(' / ');
+      if (parts) lines.push(`分镜#${sb.number}：${parts}`);
+      for (const id of this.parseIds(sb.characterIds, sb.characterId)) {
+        if (!seen.has(id)) {
+          seen.add(id);
+          ids.push(id);
+        }
+      }
+    }
+    return { lines, characterIds: ids };
+  }
+
+  /** 角色 id 列表 → 「名字：锚点」条目（锚点走 anchorTextOf，内含剥标记与去风格词） */
+  private async charAnchorLines(ids: number[], style?: GenStyle): Promise<string[]> {
+    if (!ids.length) return [];
+    const chars = await this.prisma.character.findMany({
+      where: { id: { in: ids }, deletedAt: null },
+      select: { id: true, name: true, appearance: true, anchors: true },
+    });
+    const byId = new Map(chars.map((c) => [c.id, c]));
+    const out: string[] = [];
+    for (const id of ids) {
+      const c = byId.get(id);
+      if (!c) continue;
+      const anchor = this.prompt.anchorTextOf(c, style) || (c.appearance || '').trim();
+      if (anchor) out.push(`「${c.name}」${anchor}`);
+    }
+    return out;
+  }
+
+  /** 场景的关联上下文：剧本片段 + 引用分镜画面 + 关联角色既有锚点 */
+  private async sceneAssetContext(s: any, style?: GenStyle): Promise<AssetContext> {
+    const shots = await this.shotsOfScene(s.id);
+    const { lines, characterIds } = this.shotContextLines(shots);
+    const charAnchors = await this.charAnchorLines(characterIds, style);
+    const scriptExcerpt = extractScriptExcerpt(s.episode?.scriptText, [s.location, s.time], {
+      maxChars: 400,
+    });
+    this.logAssetBasis(s.episodeId, `场景「${s.location}」`, scriptExcerpt, lines.length, charAnchors.length);
+    return { scriptExcerpt, shotLines: lines, charAnchors };
+  }
+
+  /** 道具的关联上下文：额外锁定它出现的场景（年代/材质/色调必须与场景一致） */
+  private async propAssetContext(p: any, style?: GenStyle): Promise<AssetContext> {
+    const shots = await this.shotsOfProp(p.episodeId, p.id);
+    const { lines, characterIds } = this.shotContextLines(shots);
+    const charAnchors = await this.charAnchorLines(characterIds, style);
+    const scriptExcerpt = extractScriptExcerpt(p.episode?.scriptText, [p.name, p.type], {
+      maxChars: 400,
+    });
+    const sceneIds = [...new Set(shots.map((s) => s.sceneId).filter(Boolean))] as number[];
+    const relatedScene = sceneIds.length
+      ? await this.sceneBasisLine(sceneIds)
+      : null;
+    this.logAssetBasis(
+      p.episodeId,
+      `道具「${p.name}」`,
+      scriptExcerpt,
+      lines.length,
+      charAnchors.length,
+      relatedScene,
+    );
+    return { scriptExcerpt, shotLines: lines, charAnchors, relatedScene };
+  }
+
+  /** 「地点（时段）：描述」形式的环境基准行 */
+  private async sceneBasisLine(sceneIds: number[]): Promise<string | null> {
+    const sc = await this.prisma.scene.findFirst({
+      where: { id: { in: sceneIds }, deletedAt: null },
+      select: { location: true, time: true, description: true },
+    });
+    if (!sc) return null;
+    return `${sc.location}${sc.time ? `（${sc.time}）` : ''}${
+      sc.description ? `：${sc.description}` : ''
+    }`;
+  }
+
+  /** 关联依据的可观测日志：有依据打 info，无依据必须 warn（否则等于放任自由发挥） */
+  private logAssetBasis(
+    episodeId: number,
+    label: string,
+    scriptExcerpt: string,
+    shotCount: number,
+    charCount: number,
+    relatedScene?: string | null,
+  ) {
+    const basis = `剧本片段 ${scriptExcerpt ? '有' : '无'} / 引用分镜 ${shotCount} 个 / 关联角色 ${charCount} 个${
+      relatedScene === undefined ? '' : ` / 关联场景 ${relatedScene ?? '无'}`
+    }`;
+    if (!scriptExcerpt && !shotCount && !charCount && !relatedScene) {
+      this.log(
+        episodeId,
+        'warn',
+        `${label} 没有任何关联依据（无剧本片段、无引用分镜、无关联角色/场景），本次出图仅依据自身描述，建议先补剧本拆解或分镜关联`,
+      );
+      return;
+    }
+    this.log(episodeId, 'info', `${label} 关联依据：${basis}`);
+  }
+
+  /**
+   * 素材出图的参考图。
+   * 只注入「用户自己上传的参考图」与「道具所在场景图」这类不会引入错误主体的图：
+   * 刻意不注入角色立绘 —— 场景/道具是纯素材图，注入人物立绘会让模型把人画进素材里；
+   * 角色一致性由分镜首帧阶段的角色立绘注入负责，这里只负责对齐年代与色调。
+   */
+  private async sceneRefImages(s: any): Promise<{ names: string[]; images: string[] }> {
+    const own = await this.refImageUri(s.referenceImageUrl);
+    if (!own) return { names: [], images: [] };
+    return { names: ['用户上传的参考图'], images: [own] };
+  }
+
+  private async propRefImages(p: any): Promise<{ names: string[]; images: string[] }> {
+    const names: string[] = [];
+    const images: string[] = [];
+    const own = await this.refImageUri(p.referenceImageUrl);
+    if (own) {
+      names.push('用户上传的参考图');
+      images.push(own);
+    }
+    const shots = await this.shotsOfProp(p.episodeId, p.id);
+    const sceneIds = [...new Set(shots.map((s) => s.sceneId).filter(Boolean))] as number[];
+    if (sceneIds.length && images.length < FIRST_FRAME_REF_CAP) {
+      const sc = await this.prisma.scene.findFirst({
+        where: { id: { in: sceneIds }, deletedAt: null, imageUrl: { not: null } },
+        select: { location: true, imageUrl: true, sourceUrl: true },
+      });
+      const uri = sc ? await this.refImageUri(sc.sourceUrl, sc.imageUrl) : null;
+      if (sc && uri) {
+        names.push(`场景图「${sc.location}」（仅用于对齐年代/材质/色调，不是要画的场景）`);
+        images.push(uri);
+      }
+    }
+    return { names, images };
+  }
+
+  /** 参考图 URL → 可传输 uri：远端 http 直链优先，其次本地 /uploads 转 Data URI */
+  private async refImageUri(...urls: Array<string | null | undefined>): Promise<string | null> {
+    for (const url of urls) {
+      if (!url) continue;
+      if (/^https?:\/\//i.test(url)) return url;
+      const abs = this.storage.absFromUrl(url);
+      if (abs) {
+        const uri = await this.storage.toDataUri(abs);
+        if (uri) return uri;
+      }
+    }
+    return null;
+  }
+
   private async firstEpisodeIdOfDrama(dramaId: number) {
     const ep = await this.prisma.episode.findFirst({
       where: { dramaId, deletedAt: null },
@@ -2719,5 +2966,29 @@ export class GenerateService {
     } catch {
       return { ...DEFAULT_GEN_CFG };
     }
+  }
+
+  /**
+   * 读取分集所属项目的成片规格（Drama.outputCfg）。
+   * 生图 / 生视频 / 合成三处都必须走这里 —— 任何一处硬编码画幅，
+   * 都会让「建项目时定的画幅」在最后一步才生效，前面素材全废。
+   */
+  private async resolveOutputSpec(episodeId: number): Promise<OutputSpec> {
+    if (!episodeId) return { ...DEFAULT_OUTPUT_SPEC };
+    const ep = await this.prisma.episode.findFirst({
+      where: { id: episodeId, deletedAt: null },
+      select: { drama: { select: { outputCfg: true } } },
+    });
+    return parseOutputSpec(ep?.drama?.outputCfg ?? null);
+  }
+
+  /** 读取整剧成片规格（角色形象等剧集级资源用） */
+  private async resolveOutputSpecOfDrama(dramaId: number): Promise<OutputSpec> {
+    if (!dramaId) return { ...DEFAULT_OUTPUT_SPEC };
+    const d = await this.prisma.drama.findFirst({
+      where: { id: dramaId, deletedAt: null },
+      select: { outputCfg: true },
+    });
+    return parseOutputSpec(d?.outputCfg ?? null);
   }
 }

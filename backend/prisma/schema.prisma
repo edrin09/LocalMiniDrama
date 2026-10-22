@@ -16,6 +16,7 @@ model Drama {
   description String?
   dialect     String?                  // 剧集级方言（级联第三级）
   coverStyle  String?                  // 封面风格
+  outputCfg   String?                  // 成片规格 JSON {aspect_ratio, frame_rate, resolution}：建项目时定，生图/生视频/合成全流程共用
   seed        Int?                     // 预留字段：Agnes 生图/视频接口均不支持 seed，当前不会传给任何 provider
   characters  Character[]
   episodes    Episode[]

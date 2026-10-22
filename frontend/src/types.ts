@@ -6,6 +6,8 @@ export interface Drama {
   description?: string | null;
   dialect?: string | null;
   coverStyle?: string | null;
+  /** 成片规格 JSON：建项目时定，生图/生视频/合成共用 */
+  outputCfg?: string | null;
   seed?: number | null;
   createdAt: string;
   updatedAt: string;
@@ -50,12 +52,47 @@ export interface SchedulerConfig {
   max_retries: number;
   retry_initial_delay_ms: number;
   retry_max_delay_ms?: number;
+  video_min_interval_ms?: number;
 }
 
+/** 火山引擎 TTS 凭据（可界面更换，不必改 .env） */
+export interface TtsConfig {
+  appId: string;
+  token: string;
+  cluster: string;
+  defaultVoice: string;
+  /** 是否已配置（后端只回传脱敏值 + 该标志） */
+  appIdSet?: boolean;
+  tokenSet?: boolean;
+  defaultVoiceSet?: boolean;
+}
+
+export interface AiProviderEntry {
+  name: string;
+  type?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  /** 是否已配置 Key */
+  apiKeySet?: boolean;
+  /** 能力 → 模型名；后端保证已与默认值合并，不会缺失 */
+  models: Record<string, string>;
+}
+
+/**
+ * 全局 AI 配置。
+ * 注意：apiKey 等敏感字段后端只返回脱敏串（含 ****），
+ * 原样回传表示「未修改」，后端会保留已存的真实值。
+ */
 export interface AiConfig {
   defaultProvider: string;
-  providers: Record<string, any>;
-  keys?: Record<string, any>;
+  providers: Record<string, AiProviderEntry>;
+  tts?: TtsConfig;
+}
+
+/** 合并弹窗一次性读写的全局设置 */
+export interface GlobalSettings {
+  scheduler: SchedulerConfig;
+  ai: AiConfig;
 }
 
 export interface IdialectEntry {
@@ -156,7 +193,16 @@ export interface MergeConfig {
   burn_dialogue_audio: boolean;
   burn_narration_subtitles: boolean;
   keep_original_audio: boolean;
+  /** 画幅 / 帧率 / 清晰度已上移到「建项目」，这里只保留合成专属开关 */
+  auto_correct_rotation?: boolean;
+}
+
+/**
+ * 成片规格：建项目时确定，生图 / 生视频 / 合成全流程共用。
+ * 不在合成阶段提供修改 —— 到那一步素材已按旧画幅生成完毕，改之无用只会变形。
+ */
+export interface OutputSpec {
   aspect_ratio: '9:16' | '16:9';
   frame_rate: number;
-  resolution: '1080p' | '720p';
+  resolution: '720p' | '1080p';
 }

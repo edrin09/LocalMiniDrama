@@ -22,6 +22,8 @@ import {
   ArrowDown,
   WarningFilled,
   Timer,
+  Tools,
+  Clock,
   Microphone,
   Bell,
 } from '@element-plus/icons-vue';
@@ -36,8 +38,14 @@ import {
   uploadApi,
   aiApi,
 } from '@/api';
-import { DIALECT_MAP } from '@/utils/dialect';
-import { sbIssues, speechSeconds, type SbIssue } from '@/composables/useSbHealth';
+import { DIALECT_MAP, parseOutputSpec, DEFAULT_OUTPUT_SPEC } from '@/utils/dialect';
+import {
+  sbIssues,
+  speechSeconds,
+  realIssues,
+  fixableIssues,
+  type SbIssue,
+} from '@/composables/useSbHealth';
 import type {
   Episode,
   Character,
@@ -410,6 +418,7 @@ async function loadAll() {
     episode.value = ep;
     dramaTitle.value = drama.title;
     dramaDialect.value = drama.dialect ?? null;
+    outputSpec.value = parseOutputSpec(drama.outputCfg);
     mergeConfig.value = parseMergeCfg(ep.mergeCfg);
     genCfg.value = parseGenCfg(ep.genCfg);
 
@@ -469,12 +478,20 @@ function defaultMergeCfg(): MergeConfig {
     burn_dialogue_audio: true,
     burn_narration_subtitles: true,
     keep_original_audio: false,
-    aspect_ratio: '9:16',
-    frame_rate: 30,
-    resolution: '1080p',
+    auto_correct_rotation: true,
   };
 }
 const mergeConfig = ref<MergeConfig>(defaultMergeCfg());
+
+/**
+ * 成片规格（画幅/帧率/清晰度）：来自项目（建项目时定），此处只读。
+ * 合成阶段不再提供修改 —— 素材早已按该规格生成完毕。
+ */
+const outputSpec = ref({
+  aspect_ratio: DEFAULT_OUTPUT_SPEC.aspect_ratio as string,
+  frame_rate: DEFAULT_OUTPUT_SPEC.frame_rate as number,
+  resolution: DEFAULT_OUTPUT_SPEC.resolution as string,
+});
 
 /* ================= 生成一致性配置（genCfg：画面风格 / 音轨语言） ================= */
 const ART_STYLE_OPTIONS: Array<{ value: string; label: string }> = [
@@ -870,6 +887,7 @@ function handleEvent(data: string) {
       // asset 级任务结束不代表整集生成结束
       if (e.data?.scope !== 'asset') {
         generating.value = false;
+        fillingMissing.value = false;
         flowStep.value = '';
         flowLabel.value = '';
       }
@@ -890,6 +908,7 @@ function handleEvent(data: string) {
       }
     } else if (e.type === 'error') {
       generating.value = false;
+      fillingMissing.value = false;
       clearBusy();
       ElMessage.error(e.data?.text || '生成出错');
     }
@@ -986,59 +1005,61 @@ const sbIssueMap = computed(() => {
 });
 const sbIssueCount = computed(() => {
   let n = 0;
-  for (const list of sbIssueMap.value.values()) n += list.length;
+  for (const list of sbIssueMap.value.values()) n += realIssues(list).length;
+  return n;
+});
+/** 待生成素材数（可一键补齐，不算「问题」） */
+const sbTodoCount = computed(() => {
+  let n = 0;
+  for (const list of sbIssueMap.value.values()) n += fixableIssues(list).length;
   return n;
 });
 
-/** 单镜：自动按台词把时长补到刚好念完 */
-async function autoFitDuration(sb: Storyboard) {
-  const need = speechSeconds(`${sb.dialogue || ''}${sb.narration || ''}`);
-  if (!need) {
-    ElMessage.info('本镜没有台词/旁白，无需按台词调整时长');
+/**
+ * 一键补齐所有缺失素材（角色立绘 / 场景图 / 道具图 / 分镜首尾帧）。
+ * 直接复用后端分阶段流水线：阶段间严格串行、只补缺素的项，
+ * 因此顺序天然正确（角色 → 场景 → 道具 → 分镜），不存在「先生成分镜再补角色」的问题。
+ */
+const fillingMissing = ref(false);
+async function fillMissingAssets() {
+  if (generating.value || fillingMissing.value) return;
+  if (storyboards.value.length === 0) {
+    ElMessage.warning('暂无分镜，请先完成剧本拆解');
     return;
   }
-  const next = Math.min(12, Math.max(4, Math.ceil(need)));
-  if (next === sb.duration) {
-    ElMessage.success(`本镜时长 ${next}s 已能念完台词`);
-    return;
-  }
+  fillingMissing.value = true;
+  generating.value = true;
+  addLog('info', '🧩 正在补齐缺失素材（角色立绘 → 场景图 → 道具图 → 分镜首尾帧），只补未生成的...');
   try {
-    const updated = await storyboardApi.update(sb.id, { duration: next });
-    applyStoryboardUpdate(updated);
-    ElMessage.success(`分镜 #${sb.number} 时长已调整为 ${next}s（按台词长度）`);
+    await generateApi.generateEpisode(episodeId, {
+      characters: true,
+      scenes: true,
+      props: true,
+      storyboardImages: true,
+    });
   } catch (e: any) {
-    ElMessage.error(e.message || '调整失败');
+    generating.value = false;
+    fillingMissing.value = false;
+    ElMessage.error(e.message || '补齐素材失败');
   }
+  // 成功路径由 SSE 的 done 事件复位 generating / clearBusy（见事件处理）
 }
 
-/** 全集：批量按台词长度校准时长 */
-async function autoFitAllDurations() {
-  const targets = storyboards.value
-    .map((sb) => {
-      const need = speechSeconds(`${sb.dialogue || ''}${sb.narration || ''}`);
-      if (!need) return null;
-      const next = Math.min(12, Math.max(4, Math.ceil(need)));
-      return next === sb.duration ? null : { sb, next };
-    })
-    .filter(Boolean) as { sb: Storyboard; next: number }[];
-  if (!targets.length) {
-    ElMessage.success('全部分镜时长已与台词匹配，无需调整');
-    return;
-  }
-  const failed: string[] = [];
-  for (const { sb, next } of targets) {
-    try {
-      applyStoryboardUpdate(await storyboardApi.update(sb.id, { duration: next }));
-    } catch {
-      failed.push(`#${sb.number}`);
-    }
-  }
-  if (failed.length) {
-    ElMessage.warning(`已调整 ${targets.length - failed.length} 个分镜，失败：${failed.join('、')}`);
-  } else {
-    ElMessage.success(`已按台词长度校准 ${targets.length} 个分镜时长`);
-  }
+/** 按 issue.fix 执行单条一键修复 */
+async function runIssueFix(it: SbIssue) {
+  if (it.fix?.kind === 'generateAssets') return fillMissingAssets();
 }
+
+/**
+ * 时长自动兜底的说明文案。
+ * 真正的校准发生在后端（ScriptService.updateStoryboard → normDuration），
+ * 前端只提示「台词需要多久」，不需要用户点任何按钮。
+ */
+const autoDurationHint = computed(() => {
+  const need = speechSeconds(`${sbForm.dialogue || ''}${sbForm.narration || ''}`);
+  if (!need) return 0;
+  return (sbForm.duration ?? 0) < need ? need : 0;
+});
 
 /** 分镜缩略图：优先首帧图，回退尾帧 */
 function sbThumb(sb: Storyboard): string {
@@ -1841,23 +1862,34 @@ onBeforeUnmount(() => {
             <span class="panel-title" style="margin:0">分镜列表</span>
             <span class="muted">{{ totalDuration() }}s</span>
             <button
+              v-if="sbTodoCount > 0"
+              class="lmd-btn-ghost sm"
+              :disabled="generating || fillingMissing"
+              title="自动生成所有缺失的素材（角色立绘/场景图/道具图/分镜首尾帧），只补未生成的，已有素材不动"
+              @click="fillMissingAssets"
+            >
+              <span v-if="fillingMissing" class="mini-spinner dark" />
+              <el-icon v-else :size="13"><Tools /></el-icon>{{ fillingMissing ? '补齐中...' : `补齐 ${sbTodoCount} 项素材` }}
+            </button>
+            <button
               v-if="sbIssueCount > 0"
               class="lmd-btn-ghost sm warn"
-              :title="`共 ${sbIssueCount} 处问题，点击查看`"
+              :title="`共 ${sbIssueCount} 处需人工处理，点击查看`"
               @click="issuePanelOpen = !issuePanelOpen"
             >
               <el-icon :size="13"><WarningFilled /></el-icon>{{ sbIssueCount }} 处问题
-            </button>
-            <button class="lmd-btn-ghost sm" title="按台词实际长度批量校准所有分镜时长（避免配音被截断）" @click="autoFitAllDurations">
-              <el-icon :size="13"><Timer /></el-icon>校准时长
             </button>
             <button class="lmd-btn-ghost sm" :disabled="regenSbRunning || generating" title="按当前剧本强制重做全部分镜的首尾帧与视频（统一人物风格/音轨语言）" @click="regenerateStoryboards">
               <span v-if="regenSbRunning" class="mini-spinner dark" />
               <el-icon v-else :size="13"><RefreshRight /></el-icon>{{ regenSbRunning ? '重新生成中...' : '重新生成素材' }}
             </button>
           </div>
-          <!-- 分镜体检面板：把注定出问题的点提前暴露，而不是等出片后才发现 -->
-          <div v-if="issuePanelOpen && sbIssueCount > 0" class="sb-issue-panel">
+          <!-- 分镜体检面板：待生成素材（可一键补齐）与需人工处理的问题分开呈现 -->
+          <div v-if="issuePanelOpen && (sbIssueCount > 0 || sbTodoCount > 0)" class="sb-issue-panel">
+            <div v-if="sbTodoCount > 0" class="sb-todo-head">
+              <el-icon :size="12"><Tools /></el-icon>
+              待生成素材 {{ sbTodoCount }} 项（代码可自动补齐，点上方「补齐」即可）
+            </div>
             <div v-for="sb in storyboards.filter((s) => sbIssueMap.has(s.id))" :key="sb.id" class="sb-issue-row">
               <span class="sb-issue-num">#{{ sb.number }}</span>
               <div class="sb-issue-list">
@@ -1868,7 +1900,13 @@ onBeforeUnmount(() => {
                   :class="it.level"
                   @click="selectStoryboard(storyboards.findIndex((s) => s.id === sb.id))"
                 >
-                  <el-icon :size="12"><WarningFilled /></el-icon>{{ it.text }}
+                  <el-icon :size="12"><component :is="it.level === 'todo' ? Clock : WarningFilled" /></el-icon>{{ it.text }}
+                  <button
+                    v-if="it.fix"
+                    class="sb-issue-fix"
+                    :disabled="generating || fillingMissing"
+                    @click.stop="runIssueFix(it)"
+                  >{{ it.fix.label }}</button>
                 </div>
               </div>
             </div>
@@ -2020,22 +2058,19 @@ onBeforeUnmount(() => {
                     </el-select>
                   </el-form-item>
                   <el-form-item label="时长（秒）">
+                    <!-- 时长自动校准：后端保存时按台词实际长度兜底（只抬高过短值，
+                         保留用户显式填的更长值），因此不再需要「对齐台词」按钮 -->
                     <div style="display:flex;gap:8px;align-items:center;width:100%">
                       <el-input-number v-model="sbForm.duration" :min="1" :max="30" :step="0.5" style="flex:1" />
-                      <button
-                        class="lmd-btn-ghost sm"
-                        type="button"
-                        :disabled="!speechSeconds(`${sbForm.dialogue}${sbForm.narration}`)"
-                        :title="speechSeconds(`${sbForm.dialogue}${sbForm.narration}`) ? `台词约需 ${speechSeconds(`${sbForm.dialogue}${sbForm.narration}`)}s，自动对齐` : '本镜无台词，无需对齐'"
-                        @click="autoFitDuration(selectedStoryboard)"
-                      >
-                        <el-icon :size="12"><Timer /></el-icon>对齐台词
-                      </button>
+                      <span
+                        v-if="autoDurationHint"
+                        class="autosave-tip"
+                      >台词约需 {{ autoDurationHint }}s，保存时自动兜底</span>
                     </div>
                   </el-form-item>
                 </el-form>
 
-                <!-- 本镜体检结果：定位到「哪一镜的哪一处有问题」 -->
+                <!-- 本镜体检结果：定位到「哪一镜的哪一处有问题」，可修复项直接给按钮 -->
                 <div
                   v-if="selectedStoryboard && sbIssueMap.get(selectedStoryboard.id)?.length"
                   class="sb-issue-panel inline"
@@ -2046,7 +2081,13 @@ onBeforeUnmount(() => {
                     class="sb-issue-item"
                     :class="it.level"
                   >
-                    <el-icon :size="12"><WarningFilled /></el-icon>{{ it.text }}
+                    <el-icon :size="12"><component :is="it.level === 'todo' ? Clock : WarningFilled" /></el-icon>{{ it.text }}
+                    <button
+                      v-if="it.fix"
+                      class="sb-issue-fix"
+                      :disabled="generating || fillingMissing"
+                      @click="runIssueFix(it)"
+                    >{{ it.fix.label }}</button>
                   </div>
                 </div>
 
@@ -2360,26 +2401,19 @@ onBeforeUnmount(() => {
             </label>
           </div>
 
-          <el-form label-position="top" class="edit-form merge-form">
-            <el-form-item label="画面比例">
-              <el-select v-model="mergeConfig.aspect_ratio" style="width:100%">
-                <el-option value="9:16" label="9:16 竖屏（默认）" />
-                <el-option value="16:9" label="16:9 横屏" />
-              </el-select>
-            </el-form-item>
-            <el-form-item label="帧率">
-              <el-select v-model="mergeConfig.frame_rate" style="width:100%">
-                <el-option :value="30" label="30 fps" />
-                <el-option :value="24" label="24 fps" />
-              </el-select>
-            </el-form-item>
-            <el-form-item label="输出清晰度">
-              <el-select v-model="mergeConfig.resolution" style="width:100%">
-                <el-option value="1080p" label="1080P" />
-                <el-option value="720p" label="720P" />
-              </el-select>
-            </el-form-item>
-          </el-form>
+          <!-- 成片规格：建项目时已定，此处只读。
+               素材早已按该画幅生成完毕，此处再改只会拉伸/加黑边，故不提供修改入口。 -->
+          <div class="spec-readonly">
+            <div class="spec-readonly-head">
+              成片规格（建项目时已确定）
+              <span class="lmd-range-hint">如需更改，请在项目设置中调整后重新生成素材</span>
+            </div>
+            <div class="spec-readonly-body">
+              <span class="spec-chip">{{ outputSpec.aspect_ratio }}</span>
+              <span class="spec-chip">{{ outputSpec.frame_rate }} fps</span>
+              <span class="spec-chip">{{ outputSpec.resolution }}</span>
+            </div>
+          </div>
 
           <div class="merge-actions">
             <button class="lmd-btn-primary flex items-center gap-1.5" :disabled="mergeRunning" @click="startMerge">
@@ -2396,8 +2430,8 @@ onBeforeUnmount(() => {
           <dl class="info-list">
             <div><dt>分镜数</dt><dd>{{ storyboards.length }}</dd></div>
             <div><dt>预计时长</dt><dd>{{ totalDuration() }}s</dd></div>
-            <div><dt>画面比例</dt><dd>{{ mergeConfig.aspect_ratio }}</dd></div>
-            <div><dt>输出清晰度</dt><dd>{{ mergeConfig.resolution }}</dd></div>
+            <div><dt>画面比例</dt><dd>{{ outputSpec.aspect_ratio }}</dd></div>
+            <div><dt>输出清晰度</dt><dd>{{ outputSpec.resolution }}</dd></div>
             <div>
               <dt>合成状态</dt>
               <dd>
@@ -3070,6 +3104,34 @@ onBeforeUnmount(() => {
 .merge-layout { display: grid; grid-template-columns: 1fr 320px; gap: 16px; align-items: start; }
 .merge-card, .merge-info { padding: 20px; }
 .merge-options { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
+/* 成片规格只读展示：建项目时已定，合成阶段不可改 */
+.spec-readonly {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--lmd-border, rgba(255, 255, 255, 0.08));
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.spec-readonly-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 8px;
+}
+.spec-readonly-body { display: flex; gap: 8px; flex-wrap: wrap; }
+.spec-chip {
+  padding: 2px 10px;
+  font-size: 12px;
+  color: var(--text-2);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--lmd-border, rgba(255, 255, 255, 0.08));
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+}
 .merge-toggle { display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--text-2); cursor: pointer; }
 .merge-form { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .merge-actions { display: flex; flex-direction: column; gap: 14px; margin-top: 8px; }
@@ -3176,6 +3238,31 @@ onBeforeUnmount(() => {
 .sb-issue-panel:not(.inline) .sb-issue-item:hover { color: #ffd479; }
 .sb-issue-item.error { color: #f2a0a0; }
 .sb-issue-item.warn { color: #e3c489; }
+/* todo = 素材还没生成，不是问题：中性色 + 时钟图标，避免制造焦虑 */
+.sb-issue-item.todo { color: #8fb8c9; }
+/* 体检项内嵌的一键修复按钮 */
+.sb-issue-fix {
+  margin-left: 8px;
+  padding: 1px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #9fd6e8;
+  background: rgba(143, 184, 201, 0.12);
+  border: 1px solid rgba(143, 184, 201, 0.35);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sb-issue-fix:hover:not(:disabled) { background: rgba(143, 184, 201, 0.26); color: #d4eef8; }
+.sb-issue-fix:disabled { opacity: 0.45; cursor: default; }
+.sb-todo-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 0 5px;
+  font-size: 11.5px;
+  color: #8fb8c9;
+}
 /* 分镜列表项上的问题角标 */
 .sb-warn-dot {
   display: inline-flex;
