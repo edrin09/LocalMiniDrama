@@ -6,13 +6,9 @@
 
 剧本拆解 → 角色/场景一致性 → 分镜首尾帧 → 图生视频 → 方言配音 → ffmpeg 成片，全流程跑在自己电脑上。
 
-[![GitHub stars](https://img.shields.io/github/stars/edrin09/LocalMiniDrama?style=flat-square&color=7c5cff)](https://github.com/edrin09/LocalMiniDrama/stargazers)
-[![Vue](https://img.shields.io/badge/Vue-3.5-42b883?style=flat-square&logo=vuedotjs&logoColor=white)](#技术栈)
-[![NestJS](https://img.shields.io/badge/NestJS-10-e0234e?style=flat-square&logo=nestjs&logoColor=white)](#技术栈)
-[![SQLite](https://img.shields.io/badge/SQLite-3-003b57?style=flat-square&logo=sqlite&logoColor=white)](#技术栈)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](#参与共建)
+<img src="docs/badges/vue.png" alt="Vue 3.5" height="26"> <img src="docs/badges/nestjs.png" alt="NestJS 10" height="26"> <img src="docs/badges/sqlite.png" alt="Prisma + SQLite" height="26"> <img src="docs/badges/ffmpeg.png" alt="ffmpeg" height="26"> <img src="docs/badges/local-first.png" alt="Local-first · 数据不出本机" height="26">
 
-`Local-first` · `数据不出本机` · `单机可跑`
+`单机可跑` · `无 Redis / Docker` · `仓库不含任何 API Key`
 
 [效果预览](#效果预览) · [核心特性](#核心特性) · [快速开始](#快速开始) · [常见问题](#常见问题)
 

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="159" height="26" role="img" aria-label="存储: Prisma + SQLite">
+  <title>存储: Prisma + SQLite</title>
+  <linearGradient id="s" x2="0" y2="100%">
+    <stop offset="0" stop-color="#fff" stop-opacity=".1"/>
+    <stop offset="1" stop-opacity=".1"/>
+  </linearGradient>
+  <rect width="159" height="26" rx="6" fill="#3b4048"/>
+  <rect x="42" width="117" height="26" rx="6" fill="#4a5568"/>
+  <rect x="42" width="4" height="26" fill="#4a5568"/>
+  <rect width="159" height="26" rx="6" fill="url(#s)"/>
+  <g fill="#fff" font-family="ui-sans-serif, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="12" font-weight="600" text-anchor="middle">
+    <text x="21" y="17.5">存储</text>
+    <text x="100.5" y="17.5">Prisma + SQLite</text>
+  </g>
+</svg>

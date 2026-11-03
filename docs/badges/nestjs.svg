@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="26" role="img" aria-label="后端: NestJS 10">
+  <title>后端: NestJS 10</title>
+  <linearGradient id="s" x2="0" y2="100%">
+    <stop offset="0" stop-color="#fff" stop-opacity=".1"/>
+    <stop offset="1" stop-opacity=".1"/>
+  </linearGradient>
+  <rect width="120" height="26" rx="6" fill="#3b4048"/>
+  <rect x="42" width="78" height="26" rx="6" fill="#e0234e"/>
+  <rect x="42" width="4" height="26" fill="#e0234e"/>
+  <rect width="120" height="26" rx="6" fill="url(#s)"/>
+  <g fill="#fff" font-family="ui-sans-serif, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="12" font-weight="600" text-anchor="middle">
+    <text x="21" y="17.5">后端</text>
+    <text x="81" y="17.5">NestJS 10</text>
+  </g>
+</svg>

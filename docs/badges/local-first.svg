@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="225" height="26" role="img" aria-label="部署: Local-first · 数据不出本机">
+  <title>部署: Local-first · 数据不出本机</title>
+  <linearGradient id="s" x2="0" y2="100%">
+    <stop offset="0" stop-color="#fff" stop-opacity=".1"/>
+    <stop offset="1" stop-opacity=".1"/>
+  </linearGradient>
+  <rect width="225" height="26" rx="6" fill="#3b4048"/>
+  <rect x="42" width="183" height="26" rx="6" fill="#6b5bd2"/>
+  <rect x="42" width="4" height="26" fill="#6b5bd2"/>
+  <rect width="225" height="26" rx="6" fill="url(#s)"/>
+  <g fill="#fff" font-family="ui-sans-serif, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="12" font-weight="600" text-anchor="middle">
+    <text x="21" y="17.5">部署</text>
+    <text x="133.5" y="17.5">Local-first · 数据不出本机</text>
+  </g>
+</svg>
