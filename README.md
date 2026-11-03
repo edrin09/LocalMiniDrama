@@ -6,7 +6,7 @@
 
 剧本拆解 → 角色/场景一致性 → 分镜首尾帧 → 图生视频 → 方言配音 → ffmpeg 成片，全流程跑在自己电脑上。
 
-<img src="docs/badges/vue.png" alt="Vue 3.5" height="26"> <img src="docs/badges/nestjs.png" alt="NestJS 10" height="26"> <img src="docs/badges/sqlite.png" alt="Prisma + SQLite" height="26"> <img src="docs/badges/ffmpeg.png" alt="ffmpeg" height="26"> <img src="docs/badges/local-first.png" alt="Local-first · 数据不出本机" height="26">
+<img src="docs/badges/vue.png" alt="Vue 3.5" height="26"> <img src="docs/badges/nestjs.png" alt="NestJS 10" height="26"> <img src="docs/badges/sqlite.png" alt="Prisma + SQLite" height="26"> <img src="docs/badges/ffmpeg.png" alt="ffmpeg" height="26"> <img src="docs/badges/local-first.png" alt="Local-first · 数据不出本机" height="26"> <img src="docs/badges/mit.png" alt="MIT License" height="26">
 
 `单机可跑` · `无 Redis / Docker` · `仓库不含任何 API Key`
 
@@ -150,6 +150,10 @@ run_dev.bat                   # Windows 一键启动
 欢迎 Issue 与 PR：新 Provider、提示词模板、踩坑记录都有价值。如果它帮你省下了几个通宵，点个 **Star** ⭐ 是最直接的支持。
 
 > 本项目仅供学习与技术研究使用，生成内容请遵守所在地区法律法规与平台规则。仓库不含任何 API Key，`.env`、`data/`、构建产物均已加入 `.gitignore`。
+
+## 许可证
+
+基于 [MIT License](./LICENSE) 开源，可自由用于商业项目，保留版权声明即可。
 
 ---
 
